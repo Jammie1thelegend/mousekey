@@ -1,0 +1,10 @@
+[package]
+name = "mousekey"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+env_logger = "0.11.10"
+evdev = "0.13.2"
+log = "0.4.29"
+thiserror = "2.0.18"
