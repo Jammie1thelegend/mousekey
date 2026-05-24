@@ -1,4 +1,4 @@
-use evdev::{EventSummary, SynchronizationCode};
+use evdev::{EventSummary};
 use evdev::{
     AttributeSet, AttributeSetRef, Device, EventType, InputEvent, KeyCode, RelativeAxisCode, uinput::VirtualDevice
 };
@@ -7,12 +7,8 @@ use thiserror::Error;
 use log::{info, warn, error, LevelFilter};
 use env_logger::Builder;
 
-use std::thread;
+use std::{thread, time};
 use std::sync::mpsc;
-
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-static QUIT_COMBO: AtomicUsize = AtomicUsize::new(0);
 
 const VDEVICE_NAME: &str = "mousekey";
 
@@ -27,12 +23,19 @@ pub enum Mouse2JoyError {
 }
 
 struct MouseArrow {
-    left: i32,
-    right: i32,
-    up: i32,
-    down: i32
+    x: i32,
+    y: i32,
+    x_lim_time: i32,
+    y_lim_time: i32,
 }
 
+impl Copy for MouseArrow {}
+
+impl Clone for MouseArrow {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 
 fn main() -> Result<(), Mouse2JoyError> {
 
@@ -58,6 +61,8 @@ fn main() -> Result<(), Mouse2JoyError> {
         "keyboard"
     ).unwrap();
     
+    thread::sleep(time::Duration::from_millis(100)); // gives enter key time to return to 0
+
 
     // set up merged uinput device
     let mut mousekey = create_mousekey(
@@ -69,8 +74,9 @@ fn main() -> Result<(), Mouse2JoyError> {
 
 
     // thread external transmission
-    let (ktx, rx) = mpsc::channel();
-    let mtx = ktx.clone();
+    let (ktx, rx) = mpsc::channel(); // for keyboard thread
+    let mtx = ktx.clone(); // for mouse thread
+    let rtx = ktx.clone(); // for arrow key repeat thread
 
     //keyboard thread
     thread::spawn(move || {
@@ -92,23 +98,62 @@ fn main() -> Result<(), Mouse2JoyError> {
         }
     });
 
+    let (artx, rrx) = mpsc::channel(); // sender for mouse_arrows func
+    thread::spawn(move || { // arrow key repeat thread
+        loop{
+            let mut active: (bool, u16) = rrx.recv().unwrap(); // tuple with activation, and keycode
+            let mut count:i32 = 0;
+            while active.0 == true {
+                active = match rrx.try_recv() {Ok(rep) => rep, Err(_e) => active};
+
+                thread::sleep(time::Duration::from_millis(1));
+                count += 1;
+                if count >= 50 {
+                    count = 0;
+                    let _ = rtx.send(InputEvent::new(EventType::KEY.0, active.1, 1));
+                    let _ = rtx.send(InputEvent::new(EventType::KEY.0, active.1, 0)); 
+                }
+            }
+        }
+    });
+        
+
+
     let mut mousearrow = MouseArrow {
-        left: 0,
-        right: 0,
-        up: 0,
-        down: 0
+        x: 0,
+        y: 0,
+        x_lim_time: 0,
+    y_lim_time: 0
     };
 
+    let mut quit_combo = 0;
 
-    // re-emits events through unified input device
+
+    // re-emits events through unified input device, checks for force quit and converts mouse into arrow keys
     loop {
         let input: InputEvent = rx.recv().unwrap();
-        let _ = mousekey.emit(&[mouse_to_button(input, &mousearrow)]); // processes input, and changes it if neccessary (eg mouse move to arrow key)
+
+        quit_combo = quit_check(input, quit_combo);
+
+        let mut events: Vec<InputEvent> = vec![];
+        let rep: (bool, u16);
+        (events, mousearrow, rep) = mouse_arrows(input, mousearrow);
+
+        if rep != (false, KeyCode::KEY_10CHANNELSDOWN.0) {
+            let _ = artx.send(rep);
+        }
+
+        let _ = &mousekey.emit(&events);
 
 
-        //println!("{:?}", input.value());
+        //println!("{:?}", input);
          }
     }
+
+
+
+
+
 
 fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, filter_key: KeyCode, devname:&str)-> Result<Device, Mouse2JoyError> {
     // find all input devices that can be used as a specific type of device
@@ -193,8 +238,6 @@ fn create_mousekey(name: &str, k_keys: &AttributeSetRef<KeyCode>, m_keys: &Attri
         keys.insert(k) 
     }
 
-    println!("{:?}", keys);
-
     let mut rel_axes = AttributeSet::new();
     for r in m_axes {
         rel_axes.insert(r) //duplication of the mouse's keycodes
@@ -209,39 +252,76 @@ fn create_mousekey(name: &str, k_keys: &AttributeSetRef<KeyCode>, m_keys: &Attri
     Ok(joystick)
 }
 
-fn mouse_to_button(input: InputEvent, mousearrow: &MouseArrow) -> InputEvent {
-    let empty_ev = InputEvent::new(EventType::SYNCHRONIZATION.0, SynchronizationCode::SYN_REPORT.0, 1);
-
-    let mut b_type: EventType = input.event_type();
-    let mut b_code: u16 = input.code();
-    let mut b_value: i32 = input.value();
-
-    if !(b_type == EventType::KEY || b_type == EventType::RELATIVE) {
-        let button:InputEvent = input;
-        return button
-    }
-
+fn quit_check(input: InputEvent, mut quit_combo: i32) -> i32 {
     match input.destructure() {
         // checks for force quit combo (F5+F7+F8) **NB only works if correct keyboard selected, must make sure keyboard works before activation of program!!
         EventSummary::Key(_, KeyCode::KEY_F5 | KeyCode::KEY_F7 | KeyCode::KEY_F8, _) => {
-            match input.value() {
-                0 => {QUIT_COMBO.fetch_sub(1, Ordering::SeqCst);}
-                1 => {QUIT_COMBO.fetch_add(1, Ordering::SeqCst);}
-                _ => {}
-            }
-            if QUIT_COMBO.load(Ordering::SeqCst) == 3 {panic!("__ ___ FORCE QUIT ___ __");}
-        }
-        
-
-        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, _) => {
-
-            if input.value() < 0 {b_type = EventType::KEY; b_code = KeyCode::KEY_LEFT.0; b_value = 1}
-            else {b_type = EventType::KEY; b_code = KeyCode::KEY_RIGHT.0; b_value = 1}
-
-        }
+            quit_combo += match input.value() {0 => {-1}, 1 => {1}, _ => {0}};
+            if quit_combo == 3 {panic!("__ ___ FORCE QUIT ___ __");}
+        },
         _ => {}
     }
-    let button:InputEvent = InputEvent::new(b_type.0, b_code, b_value);
-    println!("{:?}", button);
-    return button
+
+
+    return quit_combo
+}
+
+//                                                                  events,         mousearrow,  arrow repeat
+fn mouse_arrows(input: InputEvent, mut mousearrow: MouseArrow) -> (Vec<InputEvent>, MouseArrow, (bool, u16)) {
+    let move_limit: i32 = 50;
+    let hold_time: i32 = 60;
+
+    let mut rep: (bool, u16) = (false, KeyCode::KEY_10CHANNELSDOWN.0); // essentially empty
+
+    let mut events: Vec<InputEvent> = vec![];
+    match input.destructure() {
+        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, _) => {
+            mousearrow.x += input.value();
+
+            if mousearrow.x > move_limit {
+                mousearrow.x = move_limit;
+                if mousearrow.x_lim_time == 0 {
+                    events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_RIGHT.0, 1));
+                    events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_RIGHT.0, 0));
+                }
+                if mousearrow.x_lim_time >= hold_time {
+                    rep = (true, KeyCode::KEY_RIGHT.0);
+                } 
+                mousearrow.x_lim_time += 1;
+            }
+            else if mousearrow.x < -move_limit {
+                mousearrow.x = -move_limit;
+                if mousearrow.x_lim_time == 0 {
+                    events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFT.0, 1));
+                    events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFT.0, 0));
+                }
+                if mousearrow.x_lim_time >= hold_time {
+                    rep = (true, KeyCode::KEY_LEFT.0);
+                } 
+                mousearrow.x_lim_time += 1;
+            }
+            else {
+                events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_RIGHT.0, 0));
+                events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFT.0, 0));
+                if mousearrow.x_lim_time >= hold_time {
+                    rep = (false, KeyCode::KEY_LEFT.0);
+                }
+                mousearrow.x_lim_time = 0;
+            }
+
+        },
+        EventSummary::RelativeAxis(_, RelativeAxisCode::REL_Y, _) => {
+            /* mousearrow.y += input.value();
+            if mousearrow.y.abs() > 1 {
+                if mousearrow.y > 0 {events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.0, 1)); 
+                events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_UP.0, 0))}
+                
+                else {events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.0, 1)); 
+                events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_DOWN.0, 0))}
+            } */
+        },
+        _ => {events.push(input)}
+    }
+    //println!("x {}, x_lim_time {}", mousearrow.x, mousearrow.x_lim_time);
+    return (events, mousearrow, rep)
 }
