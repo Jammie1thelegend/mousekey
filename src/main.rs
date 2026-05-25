@@ -9,6 +9,12 @@ use env_logger::Builder;
 
 use std::{thread, time};
 use std::sync::mpsc;
+use std::os::unix::thread::JoinHandleExt;
+use libc::pthread_cancel;
+
+//windows
+/* use std::os::windows::thread::JoinHandleExt;
+use kernel32::TerminateThread; */
 
 const VDEVICE_NAME: &str = "mousekey";
 
@@ -81,69 +87,62 @@ fn main() -> Result<(), Mouse2JoyError> {
     //keyboard thread
     thread::spawn(move || {
         let _ = keyboard.grab();
+        let mut quit_combo = 0;
         loop{
             for ev in keyboard.fetch_events().unwrap(){
+                let ev_code: u16 = ev.code();
+                if ev_code == KeyCode::KEY_F5.0 || ev_code ==  KeyCode::KEY_F7.0 || ev_code ==  KeyCode::KEY_F8.0 {
+                    quit_combo += match ev.value() {0 => {-1}, 1 => {1}, _ => {0}};
+                    if quit_combo == 3 {panic!("__ ___ FORCE QUIT ___ __");}
+                }
+
                 ktx.send(ev).unwrap()
             }
         }
     });
 
     //mouse thread
+    let (artx, rrx) = mpsc::channel(); // sender for mouse_arrows func / thread
     thread::spawn(move || {
-        let _ = mouse.grab();
-        loop{
-            for ev in mouse.fetch_events().unwrap(){
-                mtx.send(ev).unwrap()
-            }
-        }
-    });
 
-    let (artx, rrx) = mpsc::channel(); // sender for mouse_arrows func
-    thread::spawn(move || { // arrow key repeat thread
-        loop{
-            let mut active: (bool, u16) = rrx.recv().unwrap(); // tuple with activation, and keycode
-            let mut count:i32 = 0;
-            while active.0 == true {
-                active = match rrx.try_recv() {Ok(rep) => rep, Err(_e) => active};
-
-                thread::sleep(time::Duration::from_millis(1));
-                count += 1;
-                if count >= 50 {
-                    count = 0;
-                    let _ = rtx.send(InputEvent::new(EventType::KEY.0, active.1, 1));
-                    let _ = rtx.send(InputEvent::new(EventType::KEY.0, active.1, 0)); 
-                }
-            }
-        }
-    });
-        
-
-
-    let mut mousearrow = MouseArrow {
+        let mut mousearrow = MouseArrow {
         x: 0,
         y: 0,
         x_lim_time: 0,
-    y_lim_time: 0
-    };
+        y_lim_time: 0
+        };
 
-    let mut quit_combo = 0;
+        let _ = mouse.grab();
 
+        loop{
+            for ev in mouse.fetch_events().unwrap(){
+                let rep: (bool, u16);
+                let mut events: Vec<InputEvent> = vec![ev];
+                (events, mousearrow, rep) = mouse_arrows(ev, mousearrow);
+                if rep != (false, KeyCode::KEY_10CHANNELSDOWN.0) { // if not empty
+                    let _ = artx.send(rep);
+                }
+                for e in events {mtx.send(e).unwrap()}
+            }
+        }
+    });
+
+    thread::spawn(move || { // arrow key repeat thread
+        loop{
+            let rep = rrx.recv().unwrap();
+            while rrx.recv().unwrap() != (false, KeyCode::KEY_LEFT.0) {}
+            thread::sleep(time::Duration::from_millis(50));
+            let _ = rtx.send(InputEvent::new(EventType::KEY.0, rep.1, 1));
+            let _ = rtx.send(InputEvent::new(EventType::KEY.0, rep.1, 0)); 
+        }
+    });
 
     // re-emits events through unified input device, checks for force quit and converts mouse into arrow keys
     loop {
         let input: InputEvent = rx.recv().unwrap();
 
-        quit_combo = quit_check(input, quit_combo);
-
-        let mut events: Vec<InputEvent> = vec![];
-        let rep: (bool, u16);
-        (events, mousearrow, rep) = mouse_arrows(input, mousearrow);
-
-        if rep != (false, KeyCode::KEY_10CHANNELSDOWN.0) {
-            let _ = artx.send(rep);
-        }
-
-        let _ = &mousekey.emit(&events);
+        //let mut events: Vec<InputEvent> = vec![];
+        let _ = &mousekey.emit(&[input]);
 
 
         //println!("{:?}", input);
@@ -252,24 +251,10 @@ fn create_mousekey(name: &str, k_keys: &AttributeSetRef<KeyCode>, m_keys: &Attri
     Ok(joystick)
 }
 
-fn quit_check(input: InputEvent, mut quit_combo: i32) -> i32 {
-    match input.destructure() {
-        // checks for force quit combo (F5+F7+F8) **NB only works if correct keyboard selected, must make sure keyboard works before activation of program!!
-        EventSummary::Key(_, KeyCode::KEY_F5 | KeyCode::KEY_F7 | KeyCode::KEY_F8, _) => {
-            quit_combo += match input.value() {0 => {-1}, 1 => {1}, _ => {0}};
-            if quit_combo == 3 {panic!("__ ___ FORCE QUIT ___ __");}
-        },
-        _ => {}
-    }
-
-
-    return quit_combo
-}
-
 //                                                                  events,         mousearrow,  arrow repeat
 fn mouse_arrows(input: InputEvent, mut mousearrow: MouseArrow) -> (Vec<InputEvent>, MouseArrow, (bool, u16)) {
-    let move_limit: i32 = 50;
-    let hold_time: i32 = 60;
+    let move_limit: i32 = 70;
+    let hold_time: i32 = 50;
 
     let mut rep: (bool, u16) = (false, KeyCode::KEY_10CHANNELSDOWN.0); // essentially empty
 
