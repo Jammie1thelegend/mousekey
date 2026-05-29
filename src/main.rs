@@ -9,12 +9,11 @@ use env_logger::Builder;
 
 use std::{thread, time};
 use std::sync::mpsc;
-use std::os::unix::thread::JoinHandleExt;
-use libc::pthread_cancel;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-//windows
-/* use std::os::windows::thread::JoinHandleExt;
-use kernel32::TerminateThread; */
+
+use std::path::PathBuf;
 
 const VDEVICE_NAME: &str = "mousekey";
 
@@ -78,8 +77,21 @@ fn main() -> Result<(), Mouse2JoyError> {
         mouse.supported_relative_axes().unwrap()
     ).unwrap();
 
+/*     let mousekey_devnode = mousekey.enumerate_dev_nodes_blocking().unwrap().last().unwrap();
+    let mousekey_path: PathBuf = mousekey_devnode.unwrap();
+    let mousekey_path2 = mousekey_path.clone();
 
-    // thread external transmission
+    thread::spawn(move || {
+        let mut temp_d = Device::open(mousekey_path).unwrap();
+        loop{for ev in temp_d.fetch_events().unwrap(){println!("{:?}", ev);}}
+    });
+    thread::spawn(move || {
+        let mut temp_d = Device::open(mousekey_path2).unwrap();
+        loop{for ev in temp_d.fetch_events().unwrap(){println!("{:?}", ev);}}
+    }); */
+
+
+    // thread send events to main loop
     let (ktx, rx) = mpsc::channel(); // for keyboard thread
     let mtx = ktx.clone(); // for mouse thread
     let rtx = ktx.clone(); // for arrow key repeat thread
@@ -102,7 +114,9 @@ fn main() -> Result<(), Mouse2JoyError> {
     });
 
     //mouse thread
-    let (artx, rrx) = mpsc::channel(); // sender for mouse_arrows func / thread
+    let (retx, rerx) = mpsc::channel(); // send keycode to arrow repeat thread
+    let stop_rep = Arc::new(AtomicUsize::new(0));
+    let stop_rep_ar = Arc::clone(&stop_rep);
     thread::spawn(move || {
 
         let mut mousearrow = MouseArrow {
@@ -116,32 +130,53 @@ fn main() -> Result<(), Mouse2JoyError> {
 
         loop{
             for ev in mouse.fetch_events().unwrap(){
-                let rep: (bool, u16);
                 let mut events: Vec<InputEvent> = vec![ev];
+                let rep: KeyCode;
                 (events, mousearrow, rep) = mouse_arrows(ev, mousearrow);
-                if rep != (false, KeyCode::KEY_10CHANNELSDOWN.0) { // if not empty
-                    let _ = artx.send(rep);
+
+                if rep != KeyCode::KEY_10CHANNELSDOWN {
+                    if rep == KeyCode::KEY_10CHANNELSUP{
+                        stop_rep.store(1, Ordering::Relaxed);
+                    }
+                    else {
+                        stop_rep.store(0, Ordering::Relaxed);
+                        let _ = retx.send(rep);
+                    }
                 }
-                for e in events {mtx.send(e).unwrap()}
+
+                for e in events {mtx.send(e).unwrap()};
             }
         }
     });
 
+    
     thread::spawn(move || { // arrow key repeat thread
         loop{
-            let rep = rrx.recv().unwrap();
-            while rrx.recv().unwrap() != (false, KeyCode::KEY_LEFT.0) {}
-            thread::sleep(time::Duration::from_millis(50));
-            let _ = rtx.send(InputEvent::new(EventType::KEY.0, rep.1, 1));
-            let _ = rtx.send(InputEvent::new(EventType::KEY.0, rep.1, 0)); 
+            let mut key: KeyCode = rerx.recv().unwrap();
+            //println!("RECEIVED  {:?}", key);
+            let mut time_lim: i32 = 0;
+            let max_time: i32 = 650;
+            while key != KeyCode::KEY_10CHANNELSUP || key != KeyCode::KEY_10CHANNELSDOWN {
+
+                //println!("{:?}, {:?}", key, stop_rep_ar.load(Ordering::Relaxed));
+
+                thread::sleep(time::Duration::from_millis(50));
+
+                if stop_rep_ar.load(Ordering::Relaxed) == 1 {stop_rep_ar.store(0, Ordering::Relaxed); key = KeyCode::KEY_10CHANNELSUP; break}
+
+                //time_lim += 50;
+                //if time_lim >= max_time {println!("Letting OS take over");stop_rep_ar.store(0, Ordering::Relaxed); key = KeyCode::KEY_10CHANNELSUP; break}
+
+                let _ = rtx.send(InputEvent::new(EventType::KEY.0, key.0, 1));
+                let _ = rtx.send(InputEvent::new(EventType::KEY.0, key.0, 0)); 
+            }
         }
     });
 
-    // re-emits events through unified input device, checks for force quit and converts mouse into arrow keys
+    // re-emits events through unified input device
     loop {
         let input: InputEvent = rx.recv().unwrap();
 
-        //let mut events: Vec<InputEvent> = vec![];
         let _ = &mousekey.emit(&[input]);
 
 
@@ -242,22 +277,25 @@ fn create_mousekey(name: &str, k_keys: &AttributeSetRef<KeyCode>, m_keys: &Attri
         rel_axes.insert(r) //duplication of the mouse's keycodes
     }
 
-    let joystick = VirtualDevice::builder()?
+    let mousekey = VirtualDevice::builder()?
         .name(name)
         .with_relative_axes(&rel_axes)?
         .with_keys(&keys)?
         .build()?;
 
-    Ok(joystick)
+    Ok(mousekey)
 }
 
-//                                                                  events,         mousearrow,  arrow repeat
-fn mouse_arrows(input: InputEvent, mut mousearrow: MouseArrow) -> (Vec<InputEvent>, MouseArrow, (bool, u16)) {
+
+
+
+
+
+fn mouse_arrows(input: InputEvent, mut mousearrow: MouseArrow) -> (Vec<InputEvent>, MouseArrow, KeyCode) {
     let move_limit: i32 = 70;
     let hold_time: i32 = 50;
 
-    let mut rep: (bool, u16) = (false, KeyCode::KEY_10CHANNELSDOWN.0); // essentially empty
-
+    let mut rep: KeyCode = KeyCode::KEY_10CHANNELSDOWN; // don't start repeating
     let mut events: Vec<InputEvent> = vec![];
     match input.destructure() {
         EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, _) => {
@@ -270,7 +308,11 @@ fn mouse_arrows(input: InputEvent, mut mousearrow: MouseArrow) -> (Vec<InputEven
                     events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_RIGHT.0, 0));
                 }
                 if mousearrow.x_lim_time >= hold_time {
-                    rep = (true, KeyCode::KEY_RIGHT.0);
+                    if mousearrow.x_lim_time < 1000 {
+                        mousearrow.x_lim_time = 1000;
+                        //events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_RIGHT.0, 2));
+                        rep = KeyCode::KEY_RIGHT;
+                    }
                 } 
                 mousearrow.x_lim_time += 1;
             }
@@ -281,16 +323,22 @@ fn mouse_arrows(input: InputEvent, mut mousearrow: MouseArrow) -> (Vec<InputEven
                     events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFT.0, 0));
                 }
                 if mousearrow.x_lim_time >= hold_time {
-                    rep = (true, KeyCode::KEY_LEFT.0);
+                    if mousearrow.x_lim_time < 1000 {
+                        mousearrow.x_lim_time = 1000;
+                        //events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFT.0, 2));
+                        rep = KeyCode::KEY_LEFT
+                    }
                 } 
                 mousearrow.x_lim_time += 1;
             }
             else {
                 events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_RIGHT.0, 0));
                 events.push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFT.0, 0));
+
                 if mousearrow.x_lim_time >= hold_time {
-                    rep = (false, KeyCode::KEY_LEFT.0);
+                    rep = KeyCode::KEY_10CHANNELSUP
                 }
+
                 mousearrow.x_lim_time = 0;
             }
 
