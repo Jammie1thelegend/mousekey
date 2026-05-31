@@ -95,6 +95,7 @@ fn main() -> Result<(), MouseKeyError> {
                 let ev_code: u16 = ev.code();
                 if ev_code == KeyCode::KEY_F5.0 || ev_code ==  KeyCode::KEY_F7.0 || ev_code ==  KeyCode::KEY_F8.0 {
                     quit_combo += match ev.value() {0 => {-1}, 1 => {1}, _ => {0}};
+                    if quit_combo < 0 {quit_combo = 0}
                     if quit_combo == 3 {panic!("__ ___ FORCE QUIT ___ __");}
                 }
 
@@ -311,49 +312,69 @@ fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, f
         error!("{}", MouseKeyError::NoDeviceError);
         return Err(MouseKeyError::NoDeviceError);
     }
+    if devices.len() == 1 {warn!("Only one compatible {} found! ({})", devname, devices[0].name().unwrap_or("Unknown Device"));}
 
-    // ask user which device to use
 
-    let mut index: usize = 1;
-    if !(devices.len() == 1) {
-        println!("Several {}s detected, please select one:", devname);
-        for (i, device) in devices.iter().enumerate() {
-            println!("{}: {}, more info: {:?}", i + 1, device.name().unwrap_or("Unknown Device"), device.input_id());
-        };
-        index = input_in_range(1, devices.len())
-    } else {
-        warn!("Only one compatible {} found! ({})", devname, devices[0].name().unwrap_or("Unknown Device"));
+    // await user input to confirm device is at least able to to required functions, despite the fact that it should be able to (some devices are not real)
+    let (dftx, dfrx) = mpsc::channel(); // device found channel
+    let dev_found = Arc::new(AtomicBool::new(false));
+    for p in paths{
+        let dftx_clone = dftx.clone();
+        let dev_found_clone = dev_found.clone();
+        let mut dev = Device::open(&p).unwrap();
+        let mut req_rel = filter_rel.clone().0;
+        let mut req_keys: Vec<KeyCode> = filter_keys.clone();
+        thread::spawn(move || {
+            let req_num = req_keys.len() as i32 + 1; // +1 is req_rel's length
+            let mut req_count = 0;
+
+            if req_rel == RelativeAxisCode::REL_MISC.0 {req_count += 1};
+
+            let path_perm = p.clone();
+
+            'thread_loop: loop {
+                for ev in dev.fetch_events().unwrap() {
+                    if dev_found_clone.load(Ordering::Acquire) == true {break 'thread_loop}
+
+
+                    let path_temp = path_perm.clone();
+                    let ev_code = ev.code();
+
+                    if ev.event_type() == EventType::RELATIVE {
+                        if req_rel != RelativeAxisCode::REL_MISC.0 {if ev_code == req_rel {req_count += 1; req_rel = RelativeAxisCode::REL_MISC.0}}
+                        
+                    }
+                    if ev.event_type() == EventType::KEY {
+                        let mut rem_req_keys: Vec<KeyCode> = vec![];
+
+                        for rk in &req_keys {
+                            if ev_code == rk.0 {req_count += 1; continue};
+                            rem_req_keys.push(*rk); // * dereferences
+                        }
+                        req_keys = rem_req_keys;
+                    }
+
+                    if req_count == req_num {let _ = dftx_clone.send(path_temp); break 'thread_loop}
+
+                }
+            }
+        });
+
+    }
+
+    let path: String = dfrx.recv().unwrap().to_string();
+
+    dev_found.store(true, Ordering::Release);
+    for mut d in devices {
+        let _ = d.send_events(&[InputEvent::new(EventType::KEY.0, filter_keys[0].0, 1)]);
+        let _ = d.send_events(&[InputEvent::new(EventType::KEY.0, filter_keys[0].0, 0)]);
     }
     
-    let input_device = devices.remove(index - 1);
+    
+    let input_device = Device::open(path).unwrap();
     info!("Using \"{}\" as {} input device", input_device.name().unwrap_or("Unknown Device"), devname);
     Ok(input_device)
 
-}
-
-// ask user for a usize input within a given range
-fn input_in_range(min: usize, max: usize) -> usize {
-    let mut input = String::new();
-
-    loop {
-        input.clear();
-        std::io::stdin()
-            .read_line(&mut input)
-            .expect("Failed to read line");
-
-        match input.trim().parse::<usize>() {
-            Ok(index) if index >= min && index <= max => {
-                return index;
-            }
-            _ => {
-                println!(
-                    "Invalid selection. Please enter a number between {} and {}",
-                    min, max
-                );
-                continue;
-            }
-        }
-    }
 }
 
 fn create_mousekey(name: &str, k_keys: &AttributeSetRef<KeyCode>, m_keys: &AttributeSetRef<KeyCode>, m_axes: &AttributeSetRef<RelativeAxisCode>) -> std::io::Result<VirtualDevice> {
