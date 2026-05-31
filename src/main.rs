@@ -46,7 +46,19 @@ fn main() -> Result<(), MouseKeyError> {
     Builder::new()
         .filter_level(LevelFilter::Trace)  // This shows everything
         .init();
+
+
+    // \n not needed for some reason, the visual formatting is enough.
+    println!("
+        **IMPORTANT:
+        Force quit keybind: F5+F7+F8
+        Mouse passthrough: Hold Caps Lock
+        
+        WARNING: This program redirects all of the inputs from the devices you select to its 'mousekey' uinput device.
+        Please be prepared to force quit the terminal and possibly power down your device before proceeding.
+    ");
     
+    thread::sleep(time::Duration::from_millis(1000)); // creates a gap between warning message and program begin
 
     // select mouse device
     let mut mouse = select_input_device(
