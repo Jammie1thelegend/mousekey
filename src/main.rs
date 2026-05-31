@@ -314,8 +314,14 @@ fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, f
     }
     if devices.len() == 1 {warn!("Only one compatible {} found! ({})", devname, devices[0].name().unwrap_or("Unknown Device"));}
 
-
     // await user input to confirm device is at least able to to required functions, despite the fact that it should be able to (some devices are not real)
+    if filter_rel == RelativeAxisCode::REL_MISC {
+        println!("Awaiting input to choose device, please do the following inputs on your {}: press {:?}. (Does not need to happen at the same time)", devname, filter_keys);
+    }
+    else {
+        println!("Awaiting input to choose device, please do the following inputs on your {}: move {:?}, and press {:?}. (Does not need to happen at the same time)", devname, filter_rel, filter_keys);
+    }
+
     let (dftx, dfrx) = mpsc::channel(); // device found channel
     let dev_found = Arc::new(AtomicBool::new(false));
     for p in paths{
@@ -341,14 +347,14 @@ fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, f
                     let ev_code = ev.code();
 
                     if ev.event_type() == EventType::RELATIVE {
-                        if req_rel != RelativeAxisCode::REL_MISC.0 {if ev_code == req_rel {req_count += 1; req_rel = RelativeAxisCode::REL_MISC.0}}
+                        if req_rel != RelativeAxisCode::REL_MISC.0 {if ev_code == req_rel {req_count += 1; println!("{:?} moved", RelativeAxisCode(req_rel)); req_rel = RelativeAxisCode::REL_MISC.0;}}
                         
                     }
                     if ev.event_type() == EventType::KEY {
                         let mut rem_req_keys: Vec<KeyCode> = vec![];
 
                         for rk in &req_keys {
-                            if ev_code == rk.0 {req_count += 1; continue};
+                            if ev_code == rk.0 {req_count += 1; println!("{:?} pressed", rk); continue};
                             rem_req_keys.push(*rk); // * dereferences
                         }
                         req_keys = rem_req_keys;
