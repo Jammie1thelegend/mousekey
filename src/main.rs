@@ -11,6 +11,8 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use serde::Deserialize;
+
 const VDEVICE_NAME: &str = "mousekey";
 
 
@@ -40,6 +42,13 @@ impl Clone for MouseArrow {
     }
 }
 
+#[derive(Deserialize)]
+#[derive(Debug)]
+struct Config {
+    move_limit: i32,
+    hold_time: i32,
+}
+
 fn main() -> Result<(), MouseKeyError> {
 
     // initialize logger
@@ -59,6 +68,9 @@ fn main() -> Result<(), MouseKeyError> {
     ");
     
     thread::sleep(time::Duration::from_millis(1000)); // creates a gap between warning message and program begin
+
+    let config = load_config();
+
 
     // select mouse device
     let mut mouse = select_input_device(
@@ -118,7 +130,7 @@ fn main() -> Result<(), MouseKeyError> {
         }
     });
 
-    // capslock/mouse passthrough thread, so I can thread::sleep before sending capslock(val = 0)
+    // capslock/mouse passthrough thread
     thread::spawn(move || {
         loop {
             let val = clrx.recv().unwrap();
@@ -142,27 +154,17 @@ fn main() -> Result<(), MouseKeyError> {
         const REL_X_CODE: u16 = RelativeAxisCode::REL_X.0;
         const REL_Y_CODE: u16 = RelativeAxisCode::REL_Y.0;
 
-        let move_limit = 40;
-        let hold_time = 45;
-
         let mousearrow_defaults = MouseArrow {
         x: 0,
         y: 0,
         x_lim_time: 0,
         y_lim_time: 0,
-        move_limit: move_limit,
-        hold_time: hold_time
+        move_limit: config.move_limit,
+        hold_time: config.hold_time
         };
 
 
-        let mut mousearrow = MouseArrow {
-        x: 0,
-        y: 0,
-        x_lim_time: 0,
-        y_lim_time: 0,
-        move_limit: move_limit,
-        hold_time: hold_time
-        };
+        let mut mousearrow = mousearrow_defaults.clone();
 
         let _ = mouse.grab();
 
@@ -449,4 +451,23 @@ fn mouse_arrows(vert: bool, dir: bool, mut axis_lim_time: i32, hold_time: i32) -
 
 
     return (events, axis_lim_time, rep)
+}
+
+fn load_config() -> Config {
+    let path = "config.toml";
+    let default_config = "move_limit = 40\nhold_time = 45";
+    match fs::File::open(path) {
+        Ok(file) => {file}, 
+        Err(_) => {fs::write(path, default_config).unwrap(); fs::File::open(path).unwrap()}
+    };
+
+    let config_raw = match fs::read_to_string(path) {
+        Ok(raw) => {raw}, Err(_) => {fs::write(path, default_config).unwrap(); fs::read_to_string(path).unwrap()}
+    };
+
+    let config: Config = toml::from_str(&config_raw).unwrap();
+
+
+    //println!("{:?}", config);
+    return config
 }
