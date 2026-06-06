@@ -12,9 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::process::Command;
-use std::process::Stdio;
 
-use std::io::Read;
+use std::collections::HashMap;
 
 use serde::Deserialize;
 
@@ -29,6 +28,7 @@ pub enum MouseKeyError {
     #[error("Failed to read a mouse input")]
     FailedToReadInput,
 }
+
 #[derive(Debug)]
 struct MouseArrow {
     x: i32,
@@ -61,6 +61,18 @@ fn main() -> Result<(), MouseKeyError> {
         .filter_level(LevelFilter::Trace)  // This shows everything
         .init();
 
+    let mouse_key_conv = HashMap::from([
+    (KeyCode::KEY_CAPSLOCK, KeyCode::KEY_F24),
+    (KeyCode::BTN_LEFT, KeyCode::KEY_F23),
+    (KeyCode::BTN_RIGHT, KeyCode::KEY_F22),
+    (KeyCode::BTN_MIDDLE, KeyCode::KEY_F21),
+    (KeyCode::BTN_EXTRA, KeyCode::KEY_F20),
+    (KeyCode::BTN_SIDE, KeyCode::KEY_F19),
+    (KeyCode::BTN_DPAD_UP, KeyCode::KEY_F18),
+    (KeyCode::BTN_DPAD_DOWN, KeyCode::KEY_F17),
+    ]);
+
+
 
     // \n not needed for some reason, the visual formatting is enough.
     println!("
@@ -86,6 +98,25 @@ fn main() -> Result<(), MouseKeyError> {
     ).unwrap();
 
 
+    // set up mousekey device
+    
+    let mut mousekey_keys: AttributeSet<KeyCode> = AttributeSet::new();
+    for k in &mouse_key_conv {
+        mousekey_keys.insert(*k.1)
+    }
+    mousekey_keys.insert(KeyCode::KEY_LEFT);
+    mousekey_keys.insert(KeyCode::KEY_RIGHT);
+    mousekey_keys.insert(KeyCode::KEY_UP);
+    mousekey_keys.insert(KeyCode::KEY_DOWN);
+    mousekey_keys.insert(KeyCode::KEY_CAPSLOCK);
+
+    let mut mousekey = create_mousekey(
+        VDEVICE_NAME, 
+        &mousekey_keys, 
+        mouse.supported_keys().unwrap(), 
+        mouse.supported_relative_axes().unwrap()
+    ).unwrap();
+
 
     // start kanata
     println!("\nStarting Kanata:\n");
@@ -93,22 +124,14 @@ fn main() -> Result<(), MouseKeyError> {
     let mut kanata = Command::new("./kanata_linux_x64")
         .arg("--cfg")
         .arg("mousekey.kbd")
-        .stdout(Stdio::piped())
+        //.stdout(Stdio::inherit())
         .spawn()
         .unwrap();
+    
 
-    let mut stdout = kanata.stdout.take().unwrap();
+    thread::sleep(time::Duration::from_millis(3000)); // creates a gap between warning message and program begin
 
-    let mut readbuf = vec![0; 128];
-
-    while !(String::from_utf8_lossy(&readbuf).contains("lctl+spc+esc")) {
-        stdout.read(&mut readbuf).unwrap();
-        //println!("read: `{}`", String::from_utf8_lossy(&readbuf));
-    }
-
-    thread::sleep(time::Duration::from_millis(100)); // creates a gap between warning message and program begin
-
-    println!("Kanata started. Continuing...");
+    println!("\nKanata started. Continuing...\n");
 
     //select keyboard device
     let mut keyboard = select_input_device(
@@ -121,41 +144,38 @@ fn main() -> Result<(), MouseKeyError> {
     thread::sleep(time::Duration::from_millis(100)); // gives enter key time to return to 0
 
 
-    // set up merged uinput device
-    let mut mousekey = create_mousekey(
-        VDEVICE_NAME, 
-        keyboard.supported_keys().unwrap(), 
-        mouse.supported_keys().unwrap(), 
-        mouse.supported_relative_axes().unwrap()
-    ).unwrap();
-
-
 
     // thread send events to main loop
     let (ktx, rx) = mpsc::channel(); // for keyboard thread
     let mtx = ktx.clone(); // for mouse thread
     let rtx = ktx.clone(); // for arrow key repeat thread
-    let mptx = ktx.clone(); // for mouse passthrough/ capslock thread
 
     let mouse_passthrough_tx = Arc::new(AtomicBool::new(false));
     let mouse_passthrough_rx = mouse_passthrough_tx.clone();
     let mouse_passthrough_ar = mouse_passthrough_tx.clone();
     let (cltx, clrx) = mpsc::channel();
 
+    let mousepassthrough_key = match mouse_key_conv.get(&KeyCode::KEY_CAPSLOCK) {Some(code) => {code.0}, _ => {panic!()}};
+
     //keyboard thread
     thread::spawn(move || {
         //let _ = keyboard.grab();
         let mut quit_combo = 0;
+        
+        
         loop{
             for ev in keyboard.fetch_events().unwrap(){
                 let ev_code: u16 = ev.code();
                 if ev_code == KeyCode::KEY_F5.0 || ev_code ==  KeyCode::KEY_F7.0 || ev_code ==  KeyCode::KEY_F8.0 {
                     quit_combo += match ev.value() {0 => {-1}, 1 => {1}, _ => {0}};
                     if quit_combo < 0 {quit_combo = 0}
-                    if quit_combo == 3 {panic!("__ ___ FORCE QUIT ___ __");}
+                    if quit_combo == 3 {
+                        kanata.kill().expect("WARNING!! Kanata could not be killed!!!");
+                        panic!("__ ___ FORCE QUIT ___ __");
+                    }
                 }
 
-                if ev_code == KeyCode::KEY_CAPSLOCK.0 {let _ = cltx.send(ev.value());}
+                if ev_code == mousepassthrough_key {let _ = cltx.send(ev.value());}
 
                 //ktx.send(ev).unwrap()
             }
@@ -169,8 +189,6 @@ fn main() -> Result<(), MouseKeyError> {
             if val == 2 {mouse_passthrough_tx.store(true, Ordering::Relaxed);}
             else if mouse_passthrough_tx.load(Ordering::Relaxed) == true {
                 mouse_passthrough_tx.store(false, Ordering::Relaxed);
-                let _ = mptx.send(InputEvent::new(EventType::KEY.0, KeyCode::KEY_CAPSLOCK.0, 1));
-                let _ = mptx.send(InputEvent::new(EventType::KEY.0, KeyCode::KEY_CAPSLOCK.0, 0));
             }
         }
     });
@@ -202,19 +220,47 @@ fn main() -> Result<(), MouseKeyError> {
 
         loop{
             for ev in mouse.fetch_events().unwrap(){
-                let mut events: Vec<InputEvent> = vec![];
-                let mut rep: KeyCode = KeyCode::KEY_10CHANNELSDOWN;
-
-                if mouse_passthrough_rx.load(Ordering::Relaxed) == true || 
-                (!(ev.event_type() == EventType::RELATIVE) && !(ev.event_type() == EventType::SYNCHRONIZATION)) {
-
+            
+                if mouse_passthrough_rx.load(Ordering::Relaxed) == true {
                     mousearrow = mousearrow_defaults;
                     stop_rep.store(true, Ordering::Relaxed);
                     mtx.send(ev).unwrap();
                     continue
+                }
+
+                else if !(ev.event_type() == EventType::RELATIVE) && !(ev.event_type() == EventType::SYNCHRONIZATION) {
+
+                    mousearrow = mousearrow_defaults;
+                    stop_rep.store(true, Ordering::Relaxed);
+
+                    let conv_code = match mouse_key_conv.get(&KeyCode(ev.code())) {Some(code) => {code}, None => {&KeyCode(ev.code())}};
+
+                    mtx.send(InputEvent::new(EventType::KEY.0, conv_code.0, ev.value())).unwrap();
+                    continue
                 };
 
+                if ev.code() == RelativeAxisCode::REL_WHEEL.0 {
+                    let mut conv_code: KeyCode = KeyCode::KEY_RESERVED;
+                    if ev.value() > 0 {
+                        conv_code = KeyCode::BTN_DPAD_UP;
+                    }
+                    else if ev.value() < 0 {
+                        conv_code = KeyCode::BTN_DPAD_DOWN;
+                    }
+                    if conv_code != KeyCode::KEY_RESERVED {
+                        conv_code = match mouse_key_conv.get(&conv_code) {Some(code) => {*code}, None => {continue}};
+                        mtx.send(InputEvent::new(EventType::KEY.0, conv_code.0, 1)).unwrap();
+                        mtx.send(InputEvent::new(EventType::KEY.0, conv_code.0, 0)).unwrap();
+                    }
+
+                    continue
+                }
+
+
                 if ev.value() == 0 {continue}
+
+                let mut events: Vec<InputEvent> = vec![];
+                let mut rep: KeyCode = KeyCode::KEY_10CHANNELSDOWN;
 
                 match ev.code() {
                     REL_X_CODE => {
@@ -268,7 +314,7 @@ fn main() -> Result<(), MouseKeyError> {
                         }
                     },
 
-                    _ => {events.push(ev);}
+                    _ => {}
                 }
 
                 //println!("{:?}", mousearrow);
@@ -335,7 +381,6 @@ fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, f
         let d = Device::open(&p).ok().filter(|device| device.supported_events().contains(filter_evtype));
         match d {
             Some(d) => {
-                println!("{:?}", d.name());
 
                 if filter_rel != RelativeAxisCode::REL_MISC {
                     if d.supported_relative_axes().map_or(false, |axes| axes.contains(filter_rel)) == false {continue}
@@ -433,7 +478,7 @@ fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, f
 
 }
 
-fn create_mousekey(name: &str, k_keys: &AttributeSetRef<KeyCode>, m_keys: &AttributeSetRef<KeyCode>, m_axes: &AttributeSetRef<RelativeAxisCode>) -> std::io::Result<VirtualDevice> {
+fn create_mousekey(name: &str, k_keys: &AttributeSet<KeyCode>, m_keys: &AttributeSetRef<KeyCode>, m_axes: &AttributeSetRef<RelativeAxisCode>) -> std::io::Result<VirtualDevice> {
 
     let mut keys = AttributeSet::new();
 
