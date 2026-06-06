@@ -11,6 +11,11 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::process::Command;
+use std::process::Stdio;
+
+use std::io::Read;
+
 use serde::Deserialize;
 
 const VDEVICE_NAME: &str = "mousekey";
@@ -80,6 +85,31 @@ fn main() -> Result<(), MouseKeyError> {
         "mouse"
     ).unwrap();
 
+
+
+    // start kanata
+    println!("\nStarting Kanata:\n");
+
+    let mut kanata = Command::new("./kanata_linux_x64")
+        .arg("--cfg")
+        .arg("mousekey.kbd")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdout = kanata.stdout.take().unwrap();
+
+    let mut readbuf = vec![0; 128];
+
+    while !(String::from_utf8_lossy(&readbuf).contains("lctl+spc+esc")) {
+        stdout.read(&mut readbuf).unwrap();
+        //println!("read: `{}`", String::from_utf8_lossy(&readbuf));
+    }
+
+    thread::sleep(time::Duration::from_millis(100)); // creates a gap between warning message and program begin
+
+    println!("Kanata started. Continuing...");
+
     //select keyboard device
     let mut keyboard = select_input_device(
         EventType::KEY, 
@@ -99,6 +129,8 @@ fn main() -> Result<(), MouseKeyError> {
         mouse.supported_relative_axes().unwrap()
     ).unwrap();
 
+
+
     // thread send events to main loop
     let (ktx, rx) = mpsc::channel(); // for keyboard thread
     let mtx = ktx.clone(); // for mouse thread
@@ -112,7 +144,7 @@ fn main() -> Result<(), MouseKeyError> {
 
     //keyboard thread
     thread::spawn(move || {
-        let _ = keyboard.grab();
+        //let _ = keyboard.grab();
         let mut quit_combo = 0;
         loop{
             for ev in keyboard.fetch_events().unwrap(){
@@ -125,7 +157,7 @@ fn main() -> Result<(), MouseKeyError> {
 
                 if ev_code == KeyCode::KEY_CAPSLOCK.0 {let _ = cltx.send(ev.value());}
 
-                ktx.send(ev).unwrap()
+                //ktx.send(ev).unwrap()
             }
         }
     });
@@ -292,7 +324,7 @@ fn main() -> Result<(), MouseKeyError> {
 fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, filter_keys: Vec<KeyCode>, devname:&str)-> Result<Device, MouseKeyError> {
     // find all input devices that can be used as a specific type of device
 
-    let dev_input_paths: Vec<_> = fs::read_dir("/dev/input/by-id")
+    let dev_input_paths: Vec<_> = fs::read_dir("/dev/input/")
         .unwrap()
         .filter_map(Result::ok)
         .filter_map(|entry| entry.path().into_os_string().to_str().map(String::from)).collect();
@@ -303,6 +335,8 @@ fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, f
         let d = Device::open(&p).ok().filter(|device| device.supported_events().contains(filter_evtype));
         match d {
             Some(d) => {
+                println!("{:?}", d.name());
+
                 if filter_rel != RelativeAxisCode::REL_MISC {
                     if d.supported_relative_axes().map_or(false, |axes| axes.contains(filter_rel)) == false {continue}
                 }
@@ -339,6 +373,8 @@ fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, f
     let (dftx, dfrx) = mpsc::channel(); // device found channel
     let dev_found = Arc::new(AtomicBool::new(false));
     for p in paths{
+
+
         let dftx_clone = dftx.clone();
         let dev_found_clone = dev_found.clone();
         let mut dev = Device::open(&p).unwrap();
@@ -465,6 +501,7 @@ fn load_config() -> Config {
         Ok(raw) => {raw}, Err(_) => {fs::write(path, default_config).unwrap(); fs::read_to_string(path).unwrap()}
     };
 
+    // add error handling
     let config: Config = toml::from_str(&config_raw).unwrap();
 
 
