@@ -45,3 +45,19 @@ cd mousekey
 cargo build
 ```
 which will clone the repo, navigate to it, and run `cargo build`.
+
+## Copyright/ Licencing/ Attribution
+
+Keyboard layout is a modified version of `enthium`, found at: https://github.com/sunaku/enthium
+Enthium licence/ copyright:
+
+(the ISC license)
+
+Copyright 2024 Suraj N. Kurapati https://github.com/sunaku
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+
+Rust code for using `evdev` to create a virtual device based off my fork of mouse2joy by clemjvdm:
+My fork:  https://github.com/Jammie1thelegend/mouse-steer-linux-J1TL
+Original: https://github.com/clemjvdm/mouse2joy
