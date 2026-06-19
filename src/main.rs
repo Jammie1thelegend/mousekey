@@ -1,42 +1,57 @@
-use evdev::{
-    AttributeSet, AttributeSetRef, Device, EventType, InputEvent, KeyCode, RelativeAxisCode, uinput::VirtualDevice
-};
+use rdev::{grab, listen, simulate, Key, Button, Event, EventType};
+
 use std::fs;
-use thiserror::Error;
-use log::{info, warn, error, LevelFilter};
+use log::{LevelFilter};
 use env_logger::Builder;
 
 use std::{thread, time};
-use std::sync::mpsc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering, AtomicI8};
 
-use std::process::Command;
+use std::process::{Child, Command};
 
 use std::collections::HashMap;
 
+use std::prelude::v1;
+
 use serde::Deserialize;
 
-const VDEVICE_NAME: &str = "mousekey";
 
 
-#[derive(Error, Debug)]
-pub enum MouseKeyError {
-    #[error("Failed to find a compatible input device. Make sure you are running the application with root priviledges.")]
-    NoDeviceError,
+#[derive(Deserialize)]
+#[derive(Debug)]
+pub struct Config {
+    pub move_limit: f64,
+    pub hold_time: f64,
+}
 
-    #[error("Failed to read a mouse input")]
-    FailedToReadInput,
+impl Config {
+    pub fn load() -> Self {
+        let path = "config.toml";
+        let default_config = "move_limit = 40\nhold_time = 45";
+        match fs::File::open(path) {
+            Ok(file) => {file}, 
+            Err(_) => {fs::write(path, default_config).unwrap(); fs::File::open(path).unwrap()}
+        };
+
+        let config_raw = match fs::read_to_string(path) {
+            Ok(raw) => {raw}, Err(_) => {fs::write(path, default_config).unwrap(); fs::read_to_string(path).unwrap()}
+        };
+
+    // add error handling
+        let config: Self = toml::from_str(&config_raw).unwrap();
+        return config
+    }
 }
 
 #[derive(Debug)]
-struct MouseArrow {
-    x: i32,
-    y: i32,
-    x_lim_time: i32,
-    y_lim_time: i32,
-    move_limit: i32,
-    hold_time: i32
+pub struct MouseArrow {
+    pub or_x: f64,
+    pub or_y: f64,
+    pub x_lim_time: f64,
+    pub y_lim_time: f64,
+    pub move_limit: f64,
+    pub hold_time: f64
 }
 
 impl Copy for MouseArrow {}
@@ -47,31 +62,81 @@ impl Clone for MouseArrow {
     }
 }
 
-#[derive(Deserialize)]
-#[derive(Debug)]
-struct Config {
-    move_limit: i32,
-    hold_time: i32,
+impl MouseArrow {
+    pub fn load_default() -> Self {
+        let config = Config::load();
+        Self {
+            or_x: 0.0,
+            or_y: 0.0,
+            x_lim_time: 0.0,
+            y_lim_time: 0.0,
+            move_limit: config.move_limit,
+            hold_time: config.hold_time
+        }
+    }
+
+    pub fn set_default(&mut self) -> Self {
+        self.or_x = 0.0;
+        self.or_y = 0.0;
+        self.x_lim_time = 0.0;
+        self.y_lim_time = 0.0;
+        return *self
+    }
 }
 
-fn main() -> Result<(), MouseKeyError> {
+
+
+static QUIT_COMBO: AtomicI8 = AtomicI8::new(0);
+static PASSTHROUGH: AtomicBool = AtomicBool::new(false);
+static STOP_REP: AtomicBool = AtomicBool::new(false);
+
+
+static CONV_MOUSE_BUTTON: LazyLock<HashMap<Button, Key>> = LazyLock::new(|| HashMap::from([
+    (Button::Left, Key::Unknown(0x86)),      //F23
+    (Button::Right, Key::Unknown(0x85)),     //F22
+    (Button::Middle, Key::Unknown(0x84)),    //F21
+    (Button::Unknown(0x05), Key::Unknown(0x83)),        //F20 & button_extra -> might need to change these to "keys" as button may not be recognised
+    (Button::Unknown(0x06), Key::Unknown(0x82)),        //F19 & button side
+    ]));
+
+static CONV_KEY: LazyLock<HashMap<Key, Key>> = LazyLock::new(|| HashMap::from([
+    (Key::CapsLock, Key::Unknown(0x87)),     //F24
+    (Key::UpArrow, Key::Unknown(0x81)),       //F18
+    (Key::DownArrow, Key::Unknown(0x80)),     //F17
+    ]));
+
+
+static TRACKED_KEYS_STATE: LazyLock<Mutex<HashMap<Key, i8>>> = LazyLock::new(|| Mutex::new(HashMap::from([
+    (Key::CapsLock, 0),
+    (Key::F5, 0),
+    (Key::F7, 0),
+    (Key::F8, 0),
+    ])));
+
+static TRACKED_BUTTONS_STATE: LazyLock<Mutex<HashMap<Button, i8>>> = LazyLock::new(|| Mutex::new(HashMap::from([
+    (Button::Left, 0),
+    (Button::Right, 0),
+    (Button::Middle, 0),
+    (Button::Unknown(0x05), 0),        //button_extra & side -> might need to change these to "keys" as button may not be recognised
+    (Button::Unknown(0x06), 0),
+    ])));
+
+static MOUSEARROW: LazyLock<Mutex<MouseArrow>> = LazyLock::new(|| Mutex::new(MouseArrow::load_default()));
+
+static KANATA: LazyLock<Mutex<Vec<Child>>> = LazyLock::new(|| Mutex::new(vec![]));
+
+
+fn main() {
+
 
     // initialize logger
     Builder::new()
         .filter_level(LevelFilter::Trace)  // This shows everything
         .init();
 
-    let mouse_key_conv = HashMap::from([
-    (KeyCode::KEY_CAPSLOCK, KeyCode::KEY_F24),
-    (KeyCode::BTN_LEFT, KeyCode::KEY_F23),
-    (KeyCode::BTN_RIGHT, KeyCode::KEY_F22),
-    (KeyCode::BTN_MIDDLE, KeyCode::KEY_F21),
-    (KeyCode::BTN_EXTRA, KeyCode::KEY_F20),
-    (KeyCode::BTN_SIDE, KeyCode::KEY_F19),
-    (KeyCode::BTN_DPAD_UP, KeyCode::KEY_F18),
-    (KeyCode::BTN_DPAD_DOWN, KeyCode::KEY_F17),
-    ]);
 
+    // load config to mousearrow struct
+    MouseArrow::load_default();
 
 
     // \n not needed for some reason, the visual formatting is enough.
@@ -86,104 +151,27 @@ fn main() -> Result<(), MouseKeyError> {
     
     thread::sleep(time::Duration::from_millis(1000)); // creates a gap between warning message and program begin
 
-    let config = load_config();
-
-
-    // select mouse device
-    let mut mouse = select_input_device(
-        EventType::RELATIVE, 
-        RelativeAxisCode::REL_X, 
-        vec![KeyCode::BTN_LEFT], 
-        "mouse"
-    ).unwrap();
-
-
-    // set up mousekey device
-    
-    let mut mousekey_keys: AttributeSet<KeyCode> = AttributeSet::new();
-    for k in &mouse_key_conv {
-        mousekey_keys.insert(*k.1)
-    }
-    mousekey_keys.insert(KeyCode::KEY_LEFT);
-    mousekey_keys.insert(KeyCode::KEY_RIGHT);
-    mousekey_keys.insert(KeyCode::KEY_UP);
-    mousekey_keys.insert(KeyCode::KEY_DOWN);
-    mousekey_keys.insert(KeyCode::KEY_CAPSLOCK);
-
-    let mut mousekey = create_mousekey(
-        VDEVICE_NAME, 
-        &mousekey_keys, 
-        mouse.supported_keys().unwrap(), 
-        mouse.supported_relative_axes().unwrap()
-    ).unwrap();
-
-
     // start kanata
     println!("\nStarting Kanata:\n");
 
-    let mut kanata = Command::new("./kanata_linux_x64")
+    // look into wintercept driver version
+
+    KANATA.lock().unwrap().push(Command::new("./kanata_windows_tty_winIOv2_x64.exe")
         .arg("--cfg")
         .arg("mousekey.kbd")
-        //.stdout(Stdio::inherit())
         .spawn()
-        .unwrap();
+        .unwrap());
     
 
     thread::sleep(time::Duration::from_millis(3000)); // creates a gap between warning message and program begin
 
     println!("\nKanata started. Continuing...\n");
 
-    //select keyboard device
-    let mut keyboard = select_input_device(
-        EventType::KEY, 
-        RelativeAxisCode::REL_MISC, 
-        vec![KeyCode::KEY_F5, KeyCode::KEY_F7, KeyCode::KEY_F8], 
-        "keyboard"
-    ).unwrap();
-    
-    thread::sleep(time::Duration::from_millis(100)); // gives enter key time to return to 0
 
-
-
-    // thread send events to main loop
-    let (ktx, rx) = mpsc::channel(); // for keyboard thread
-    let mtx = ktx.clone(); // for mouse thread
-    let rtx = ktx.clone(); // for arrow key repeat thread
-
-    let mouse_passthrough_tx = Arc::new(AtomicBool::new(false));
-    let mouse_passthrough_rx = mouse_passthrough_tx.clone();
-    let mouse_passthrough_ar = mouse_passthrough_tx.clone();
-    let (cltx, clrx) = mpsc::channel();
-
-    let mousepassthrough_key = match mouse_key_conv.get(&KeyCode::KEY_CAPSLOCK) {Some(code) => {code.0}, _ => {panic!()}};
-
-    //keyboard thread
-    thread::spawn(move || {
-        //let _ = keyboard.grab();
-        let mut quit_combo = 0;
-        
-        
-        loop{
-            for ev in keyboard.fetch_events().unwrap(){
-                let ev_code: u16 = ev.code();
-                if ev_code == KeyCode::KEY_F5.0 || ev_code ==  KeyCode::KEY_F7.0 || ev_code ==  KeyCode::KEY_F8.0 {
-                    quit_combo += match ev.value() {0 => {-1}, 1 => {1}, _ => {0}};
-                    if quit_combo < 0 {quit_combo = 0}
-                    if quit_combo == 3 {
-                        kanata.kill().expect("WARNING!! Kanata could not be killed!!!");
-                        panic!("__ ___ FORCE QUIT ___ __");
-                    }
-                }
-
-                if ev_code == mousepassthrough_key {let _ = cltx.send(ev.value());}
-
-                //ktx.send(ev).unwrap()
-            }
-        }
-    });
+    //let (cltx, clrx) = mpsc::channel();
 
     // capslock/mouse passthrough thread
-    thread::spawn(move || {
+    /* thread::spawn(move || {
         loop {
             let val = clrx.recv().unwrap();
             if val == 2 {mouse_passthrough_tx.store(true, Ordering::Relaxed);}
@@ -191,365 +179,217 @@ fn main() -> Result<(), MouseKeyError> {
                 mouse_passthrough_tx.store(false, Ordering::Relaxed);
             }
         }
-    });
-
-
-    //mouse thread
-    let (retx, rerx) = mpsc::channel(); // send keycode to arrow repeat thread
-    let stop_rep = Arc::new(AtomicBool::new(false));
-    let stop_rep_ar = Arc::clone(&stop_rep);
-    thread::spawn(move || {
-
-        // appease the match logic; it does not approve of a match arm being RelativeAxisCode::REL_X.0, must be a constant
-        const REL_X_CODE: u16 = RelativeAxisCode::REL_X.0;
-        const REL_Y_CODE: u16 = RelativeAxisCode::REL_Y.0;
-
-        let mousearrow_defaults = MouseArrow {
-        x: 0,
-        y: 0,
-        x_lim_time: 0,
-        y_lim_time: 0,
-        move_limit: config.move_limit,
-        hold_time: config.hold_time
-        };
-
-
-        let mut mousearrow = mousearrow_defaults.clone();
-
-        let _ = mouse.grab();
-
-        loop{
-            for ev in mouse.fetch_events().unwrap(){
-            
-                if mouse_passthrough_rx.load(Ordering::Relaxed) == true {
-                    mousearrow = mousearrow_defaults;
-                    stop_rep.store(true, Ordering::Relaxed);
-                    mtx.send(ev).unwrap();
-                    continue
-                }
-
-                else if !(ev.event_type() == EventType::RELATIVE) && !(ev.event_type() == EventType::SYNCHRONIZATION) {
-
-                    mousearrow = mousearrow_defaults;
-                    stop_rep.store(true, Ordering::Relaxed);
-
-                    let conv_code = match mouse_key_conv.get(&KeyCode(ev.code())) {Some(code) => {code}, None => {&KeyCode(ev.code())}};
-
-                    mtx.send(InputEvent::new(EventType::KEY.0, conv_code.0, ev.value())).unwrap();
-                    continue
-                };
-
-                if ev.code() == RelativeAxisCode::REL_WHEEL.0 {
-                    let mut conv_code: KeyCode = KeyCode::KEY_RESERVED;
-                    if ev.value() > 0 {
-                        conv_code = KeyCode::BTN_DPAD_UP;
-                    }
-                    else if ev.value() < 0 {
-                        conv_code = KeyCode::BTN_DPAD_DOWN;
-                    }
-                    if conv_code != KeyCode::KEY_RESERVED {
-                        conv_code = match mouse_key_conv.get(&conv_code) {Some(code) => {*code}, None => {continue}};
-                        mtx.send(InputEvent::new(EventType::KEY.0, conv_code.0, 1)).unwrap();
-                        mtx.send(InputEvent::new(EventType::KEY.0, conv_code.0, 0)).unwrap();
-                    }
-
-                    continue
-                }
-
-
-                if ev.value() == 0 {continue}
-
-                let mut events: Vec<InputEvent> = vec![];
-                let mut rep: KeyCode = KeyCode::KEY_10CHANNELSDOWN;
-
-                match ev.code() {
-                    REL_X_CODE => {
-                        mousearrow.x += ev.value();
-                        if mousearrow.x.abs() > (mousearrow.move_limit as f64 * 0.75) as i32 {mousearrow.y = 0};
-                        if mousearrow.x.abs() >= mousearrow.move_limit {
-                            let mut dir = 1; //defaults to right, positive movement and KEY_RIGHT
-                            if ev.value() < 0 {dir = -1};
-                            mousearrow.x = mousearrow.move_limit*dir;
-
-                            let dir_bool = match dir {1 => {true}, -1 => {false}, _ => {false}};
-
-                            let vert = false;
-
-                            (events, mousearrow.x_lim_time, rep) = mouse_arrows(
-                                vert, dir_bool, mousearrow.x_lim_time, mousearrow.hold_time
-                                );
-                            
-                        }
-                        else {
-                            if mousearrow.x_lim_time >= mousearrow.hold_time {
-                               rep = KeyCode::KEY_10CHANNELSUP
-                            }
-
-                            mousearrow.x_lim_time = 0; 
-                        }
-                    },
-                    REL_Y_CODE => {
-                        mousearrow.y += ev.value();
-                        if mousearrow.y.abs() > (mousearrow.move_limit as f64 * 0.75) as i32 {mousearrow.x = 0};
-                        if mousearrow.y.abs() >= mousearrow.move_limit {
-                            let mut dir = 1; //defaults to down, positive movement and KEY_DOWN
-                            if ev.value() < 0 {dir = -1};
-                            mousearrow.y = mousearrow.move_limit*dir;
-
-                            let dir_bool = match dir {1 => {true}, -1 => {false}, _ => {false}};
-
-                            let vert = true;
-
-                            (events, mousearrow.y_lim_time, rep) = mouse_arrows(
-                                vert, dir_bool, mousearrow.y_lim_time, mousearrow.hold_time
-                                );
-                            
-                        }
-                        else {
-                            if mousearrow.y_lim_time >= mousearrow.hold_time {
-                               rep = KeyCode::KEY_10CHANNELSUP
-                            }
-
-                            mousearrow.y_lim_time = 0; 
-                        }
-                    },
-
-                    _ => {}
-                }
-
-                //println!("{:?}", mousearrow);
-
-                if rep != KeyCode::KEY_10CHANNELSDOWN {
-                    if rep == KeyCode::KEY_10CHANNELSUP{
-                        stop_rep.store(true, Ordering::Relaxed);
-                    }
-                    else {
-                        stop_rep.store(false, Ordering::Relaxed);
-                        let _ = retx.send(rep);
-                    }
-                }
-
-                for e in events {mtx.send(e).unwrap()};
-            }
-        }
-    });
-
+    }); */
     
-    thread::spawn(move || { // arrow key repeat thread
-        loop{
-            let mut key: KeyCode = rerx.recv().unwrap();
-
-            while key != KeyCode::KEY_10CHANNELSUP || key != KeyCode::KEY_10CHANNELSDOWN {
-
-                thread::sleep(time::Duration::from_millis(50));
-
-                if stop_rep_ar.load(Ordering::Relaxed) == true || mouse_passthrough_ar.load(Ordering::Relaxed) == true {stop_rep_ar.store(false, Ordering::Relaxed); key = KeyCode::KEY_10CHANNELSUP; break}
-
-                let _ = rtx.send(InputEvent::new(EventType::KEY.0, key.0, 1));
-                let _ = rtx.send(InputEvent::new(EventType::KEY.0, key.0, 0)); 
-            }
+    
+    thread::spawn(move || { 
+        loop {
+            let _ = listen(listen_callback);
         }
     });
 
-    // re-emits events through unified input device
+
+
+    // main loop
+
     loop {
-        let input: InputEvent = rx.recv().unwrap();
+        let _ = grab(grab_callback);
 
-        let _ = &mousekey.emit(&[input]);
-
-
-        //println!("{:?}", input);
          }
     }
 
+fn listen_callback(ev: Event){
+    match ev.event_type {
+        EventType::KeyPress(k) => {if !(TRACKED_KEYS_STATE.lock().unwrap().contains_key(&k)) {};  process_keyboard(k, true);},
+        EventType::KeyRelease(k) => {if !(TRACKED_KEYS_STATE.lock().unwrap().contains_key(&k)) {};  process_keyboard(k, false);},
+        _ => {}
+    }
+}
 
 
 
+fn grab_callback(ev: Event) -> Option<Event> {
+    match check_mouse_passthrough() {false => {}, true => {return Some(ev)}};
+    match ev.event_type {
+        EventType::ButtonPress(b) => {if !(TRACKED_BUTTONS_STATE.lock().unwrap().contains_key(&b)) {return Some(ev)};  process_mouse_b(b, true); return v1::None},
+        EventType::ButtonRelease(b) => {if !(TRACKED_BUTTONS_STATE.lock().unwrap().contains_key(&b)) {return Some(ev)};  process_mouse_b(b, false); return v1::None},
+        EventType::Wheel { delta_x: _, delta_y } => {process_mouse_w(delta_y); return v1::None}
+        EventType::MouseMove { x, y } => {process_mouse_m(x, y); return v1::None}
+        _ => {return Some(ev)}
+    }
+}
 
+fn process_keyboard(key: Key, down: bool) {
+    let mut tracked_val = match TRACKED_KEYS_STATE.lock().unwrap().get(&key) {Some(k) => {*k}, v1::None => {return}};
 
-fn select_input_device(filter_evtype: EventType, filter_rel: RelativeAxisCode, filter_keys: Vec<KeyCode>, devname:&str)-> Result<Device, MouseKeyError> {
-    // find all input devices that can be used as a specific type of device
+    match down {
+        true => {if tracked_val == 2 {} else if tracked_val == 1 {tracked_val = 2} else {tracked_val = 1}}
+        false => {tracked_val = 0}
+    }
+    let _ = TRACKED_KEYS_STATE.lock().unwrap().entry(key).and_modify(|val| *val = tracked_val);
+    
 
-    let dev_input_paths: Vec<_> = fs::read_dir("/dev/input/")
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.path().into_os_string().to_str().map(String::from)).collect();
-
-    let mut devices: Vec<Device> = Vec::new();
-    let mut paths:Vec<String> = Vec::new();
-    for p in dev_input_paths {
-        let d = Device::open(&p).ok().filter(|device| device.supported_events().contains(filter_evtype));
-        match d {
-            Some(d) => {
-
-                if filter_rel != RelativeAxisCode::REL_MISC {
-                    if d.supported_relative_axes().map_or(false, |axes| axes.contains(filter_rel)) == false {continue}
-                }
-                if d.supported_keys().map_or(false, |keys| {
-                    let mut correct_keys = 0;
-                    for fk in &filter_keys {if keys.contains(*fk) {correct_keys += 1}}; // borrows then dereferences, just pleasing the compiler
-                    if correct_keys == filter_keys.len() {true}
-                    else {false}
-                    }
-                ) == false {continue}
-
-                devices.push(d); 
-                paths.push(p);
-
-                },
-            _ => continue
+    if key == Key::F5 || key ==  Key::F7 || key ==  Key::F8 {
+        let mut qc = QUIT_COMBO.load(Ordering::Relaxed);
+        qc += match tracked_val {0 => {-1}, 1 => {1}, _ => {0; return}};
+        if qc < 0 {qc = 0}
+        if qc == 3 {
+            KANATA.lock().unwrap()[0].kill().expect("WARNING!! Kanata could not be killed!!!");
+            panic!("__ ___ FORCE QUIT ___ __");
         }
+        QUIT_COMBO.store(qc, Ordering::Relaxed);
+        return
     }
     
-    if devices.is_empty() {
-        error!("{}", MouseKeyError::NoDeviceError);
-        return Err(MouseKeyError::NoDeviceError);
+    //let passthrough: Key = *CONV_KEY.get(&Key::CapsLock).unwrap();
+    let passthrough: Key = Key::CapsLock;
+    if key == passthrough {//let _ = cltx.send(tracked_val);
+        if tracked_val == 2 {PASSTHROUGH.store(true, Ordering::Relaxed);}
+        else if PASSTHROUGH.load(Ordering::Relaxed) == true {
+            PASSTHROUGH.store(false, Ordering::Relaxed);
     }
-    if devices.len() == 1 {warn!("Only one compatible {} found! ({})", devname, devices[0].name().unwrap_or("Unknown Device"));}
+}
 
-    // await user input to confirm device is at least able to to required functions, despite the fact that it should be able to (some devices are not real)
-    if filter_rel == RelativeAxisCode::REL_MISC {
-        println!("Awaiting input to choose device, please do the following inputs on your {}: press {:?}. (Does not need to happen at the same time)", devname, filter_keys);
+}
+
+fn process_mouse_b(button: Button, down: bool) {
+    /* let mut tracked_val = match TRACKED_BUTTONS_STATE.lock().unwrap().get_mut(&button) {Some(b) => {*b}, v1::None => {return}};
+
+    match down {
+        true => {if tracked_val == 2 {} else if tracked_val == 1 {tracked_val = 2} else {tracked_val = 1}}
+        false => {tracked_val = 0}
+    } */
+    *MOUSEARROW.lock().unwrap() = MouseArrow::set_default(&mut MOUSEARROW.lock().unwrap());
+    STOP_REP.store(true, Ordering::Relaxed);
+
+    let conv_button = *CONV_MOUSE_BUTTON.get(&button).unwrap();
+
+    match down {
+        true => {let _ = simulate(&EventType::KeyPress(conv_button));}
+        false => {let _ = simulate(&EventType::KeyRelease(conv_button));}
+    }
+    return
+
+}
+
+fn process_mouse_w(value: i64) {
+    if value == 0 {return}
+
+    let mut dir_code = Key::Return;
+
+    if value > 0 {
+        dir_code = Key::UpArrow;
+    }
+    else if value < 0 {
+        dir_code = Key::DownArrow;
+    }
+    if dir_code != Key::Return {
+        let conv_code = match CONV_KEY.get(&dir_code) {Some(code) => {*code}, v1::None => {return}};
+        let _ = simulate(&EventType::KeyPress(conv_code));
+        let _ = simulate(&EventType::KeyRelease(conv_code));
+    }
+
+}
+
+fn process_mouse_m(x: f64, y: f64) {
+    let mut mousearrow = MOUSEARROW.lock().unwrap().clone();
+    
+    if mousearrow.or_x == 0.0 && mousearrow.or_y == 0.0 {
+        mousearrow.or_x = x;
+        mousearrow.or_y = y;
+        *MOUSEARROW.lock().unwrap() = mousearrow;
+        return
+    }
+    let mut rel_x = x- mousearrow.or_x;
+    let mut rel_y = mousearrow.or_y - y;
+
+    // "normalise" -> we only want one axis at a time to be near move_limit
+
+    if rel_x.abs() > (mousearrow.move_limit* 0.75) {rel_y = 0.0};
+    if rel_y.abs() > (mousearrow.move_limit* 0.75) {rel_x = 0.0};
+
+    if rel_x.abs() >= mousearrow.move_limit {
+        /* let mut dir = 1; // only if we need to store current pos
+        if rel_x < 0.0 {dir = -1}; */
+        let mut key = Key::LeftArrow;
+        if rel_x > 0.0 {key = Key::RightArrow};
+
+        mousearrow.x_lim_time = mouse_arrows(key,mousearrow.x_lim_time);
+        
+    }
+
+    else if rel_y.abs() >= mousearrow.move_limit {
+        /* let mut dir = 1; // only if we need to store current pos
+        if rel_y < 0.0 {dir = -1}; */
+        let mut key = Key::DownArrow;
+        if rel_y > 0.0 {key = Key::UpArrow};
+
+        mousearrow.y_lim_time = mouse_arrows(key,mousearrow.y_lim_time);
+        
     }
     else {
-        println!("Awaiting input to choose device, please do the following inputs on your {}: move {:?}, and press {:?}. (Does not need to happen at the same time)", devname, filter_rel, filter_keys);
-    }
-
-    let (dftx, dfrx) = mpsc::channel(); // device found channel
-    let dev_found = Arc::new(AtomicBool::new(false));
-    for p in paths{
+        STOP_REP.store(true, Ordering::Relaxed);
+        mousearrow.x_lim_time = 0.0;
+        mousearrow.y_lim_time = 0.0;
+    } // stop repeating
 
 
-        let dftx_clone = dftx.clone();
-        let dev_found_clone = dev_found.clone();
-        let mut dev = Device::open(&p).unwrap();
-        let mut req_rel = filter_rel.clone().0;
-        let mut req_keys: Vec<KeyCode> = filter_keys.clone();
-        thread::spawn(move || {
-            let req_num = req_keys.len() as i32 + 1; // +1 is req_rel's length
-            let mut req_count = 0;
 
-            if req_rel == RelativeAxisCode::REL_MISC.0 {req_count += 1};
-
-            let path_perm = p.clone();
-
-            'thread_loop: loop {
-                for ev in dev.fetch_events().unwrap() {
-                    if dev_found_clone.load(Ordering::Acquire) == true {break 'thread_loop}
-
-
-                    let path_temp = path_perm.clone();
-                    let ev_code = ev.code();
-
-                    if ev.event_type() == EventType::RELATIVE {
-                        if req_rel != RelativeAxisCode::REL_MISC.0 {if ev_code == req_rel {req_count += 1; println!("{:?} moved", RelativeAxisCode(req_rel)); req_rel = RelativeAxisCode::REL_MISC.0;}}
-                        
-                    }
-                    if ev.event_type() == EventType::KEY {
-                        let mut rem_req_keys: Vec<KeyCode> = vec![];
-
-                        for rk in &req_keys {
-                            if ev_code == rk.0 {req_count += 1; println!("{:?} pressed", rk); continue};
-                            rem_req_keys.push(*rk); // * dereferences
-                        }
-                        req_keys = rem_req_keys;
-                    }
-
-                    if req_count == req_num {let _ = dftx_clone.send(path_temp); break 'thread_loop}
-
-                }
-            }
-        });
-
-    }
-
-    let path: String = dfrx.recv().unwrap().to_string();
-
-    dev_found.store(true, Ordering::Release);
-    for mut d in devices {
-        let _ = d.send_events(&[InputEvent::new(EventType::KEY.0, filter_keys[0].0, 1)]);
-        let _ = d.send_events(&[InputEvent::new(EventType::KEY.0, filter_keys[0].0, 0)]);
-    }
-    
-    
-    let input_device = Device::open(path).unwrap();
-    info!("Using \"{}\" as {} input device", input_device.name().unwrap_or("Unknown Device"), devname);
-    Ok(input_device)
+    *MOUSEARROW.lock().unwrap() = mousearrow;
 
 }
 
-fn create_mousekey(name: &str, k_keys: &AttributeSet<KeyCode>, m_keys: &AttributeSetRef<KeyCode>, m_axes: &AttributeSetRef<RelativeAxisCode>) -> std::io::Result<VirtualDevice> {
-
-    let mut keys = AttributeSet::new();
-
-    for k in k_keys { //duplication of the keyboard's keycodes
-        keys.insert(k) 
-    }
-    for k in m_keys { //duplication of the mouse's keycodes
-        keys.insert(k) 
-    }
-
-    let mut rel_axes = AttributeSet::new();
-    for r in m_axes {
-        rel_axes.insert(r) //duplication of the mouse's keycodes
-    }
-
-    let mousekey = VirtualDevice::builder()?
-        .name(name)
-        .with_relative_axes(&rel_axes)?
-        .with_keys(&keys)?
-        .build()?;
-
-    Ok(mousekey)
-}
 
 
-fn mouse_arrows(vert: bool, dir: bool, mut axis_lim_time: i32, hold_time: i32) -> (Vec<InputEvent>, i32, KeyCode) {
-    let mut rep: KeyCode = KeyCode::KEY_10CHANNELSDOWN; // don't start repeating
-    let mut events: Vec<InputEvent> = vec![];
 
-    let mut key: KeyCode;
-    // dir: true = right/ down, false = left/ up
-    key = match dir {true => {KeyCode::KEY_RIGHT}, false => {KeyCode::KEY_LEFT}};
 
-    if vert == true {
-        key = match dir {true => {KeyCode::KEY_DOWN}, false => {KeyCode::KEY_UP}};
-    };
+fn mouse_arrows(key: Key, mut axis_lim_time: f64) -> f64 {
+    let hold_time = MOUSEARROW.lock().unwrap().hold_time;
 
-    if axis_lim_time == 0 {
-        events.push(InputEvent::new(EventType::KEY.0, key.0, 1));
-        events.push(InputEvent::new(EventType::KEY.0, key.0, 0));
+
+
+    if axis_lim_time == 0.0 {
+        let _ = simulate(&EventType::KeyPress(key));
+        let _ = simulate(&EventType::KeyRelease(key));
     }
 
     if axis_lim_time > hold_time {
-        if axis_lim_time < 1000 {
-            axis_lim_time = 1000;
-            rep = key;
+        if axis_lim_time < 1000.0 {
+            axis_lim_time = 1000.0;
+            STOP_REP.store(true, Ordering::Relaxed);
+            thread::sleep(time::Duration::from_millis(51));
+            STOP_REP.store(false, Ordering::Relaxed);
+            create_m_ar_thread(key);
         }
     }
 
-    axis_lim_time += 1;
+    axis_lim_time += 1.0;
+    return axis_lim_time
 
-
-    return (events, axis_lim_time, rep)
 }
 
-fn load_config() -> Config {
-    let path = "config.toml";
-    let default_config = "move_limit = 40\nhold_time = 45";
-    match fs::File::open(path) {
-        Ok(file) => {file}, 
-        Err(_) => {fs::write(path, default_config).unwrap(); fs::File::open(path).unwrap()}
-    };
+fn create_m_ar_thread(rep_key: Key) {
+    thread::spawn(move || { 
+        while STOP_REP.load(Ordering::Relaxed) == false {
 
-    let config_raw = match fs::read_to_string(path) {
-        Ok(raw) => {raw}, Err(_) => {fs::write(path, default_config).unwrap(); fs::read_to_string(path).unwrap()}
-    };
+            thread::sleep(time::Duration::from_millis(50));
 
-    // add error handling
-    let config: Config = toml::from_str(&config_raw).unwrap();
+            if STOP_REP.load(Ordering::Relaxed) == true || PASSTHROUGH.load(Ordering::Relaxed) == true {STOP_REP.store(false, Ordering::Relaxed); break}
 
-
-    //println!("{:?}", config);
-    return config
+            let _ = simulate(&EventType::KeyPress(rep_key));
+            let _ = simulate(&EventType::KeyRelease(rep_key));
+        }
+    });
 }
+
+fn check_mouse_passthrough() -> bool {
+    if PASSTHROUGH.load(Ordering::Relaxed) == true {
+        *MOUSEARROW.lock().unwrap() = MouseArrow::set_default(&mut *MOUSEARROW.lock().unwrap());
+        STOP_REP.store(true, Ordering::Relaxed);
+        return true
+    }
+
+    return false
+}
+
+

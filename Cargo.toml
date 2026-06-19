@@ -7,9 +7,11 @@ edition = "2024"
 env_logger = "0.11.10"
 evdev = "0.13.2"
 log = "0.4.29"
+rdev = { git = "https://github.com/Narsil/rdev", rev = "b7e201b", features = ["unstable_grab", "x11"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 toml = "1.1.2"
+
 
 # used to panic! the entire program from a thread
 [profile.release]
