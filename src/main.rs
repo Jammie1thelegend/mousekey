@@ -1,28 +1,46 @@
-use rdev::{grab, listen, simulate, Key, Button, Event, EventType};
 
-use std::fs;
-use log::{LevelFilter};
-use env_logger::Builder;
+use std::process::Command;
 
 use std::{thread, time};
 use std::sync::{LazyLock, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering, AtomicI8};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use std::process::{Child, Command};
+use std::fs;
 
-use std::collections::HashMap;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos};
+use windows::Win32::UI::Input::KeyboardAndMouse::{self, VIRTUAL_KEY};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
-use std::prelude::v1;
+use enigo::{Enigo, Key, Keyboard, Mouse, Settings, Coordinate};
+use enigo::Direction::{Press, Release};
+
+use thiserror::Error;
 
 use serde::Deserialize;
 
+#[derive(Error, Debug)]
+pub enum MouseKeyError {
+    #[error("Failed to get current mouse position.")]
+    FailedGetMousePosition,
+}
+
+
+const KEY_PRESS_VAL_BIG: i16 = -32768;
+const KEY_PRESS_VAL_SMALL: i16 = -32767;
+const QUIT_KEYS: [VIRTUAL_KEY; 3] = [KeyboardAndMouse::VK_F5, KeyboardAndMouse::VK_F7, KeyboardAndMouse::VK_F8];
+
+static PASSTHROUGH: AtomicBool = AtomicBool::new(false);
+static STOP_REP: AtomicBool = AtomicBool::new(false);
+
+static ENIGO: LazyLock<Mutex<Enigo>> = LazyLock::new(|| Mutex::new(Enigo::new(&Settings::default()).unwrap()));
 
 
 #[derive(Deserialize)]
 #[derive(Debug)]
 pub struct Config {
-    pub move_limit: f64,
-    pub hold_time: f64,
+    pub move_limit: i32,
+    pub hold_time: i32,
 }
 
 impl Config {
@@ -46,12 +64,14 @@ impl Config {
 
 #[derive(Debug)]
 pub struct MouseArrow {
-    pub or_x: f64,
-    pub or_y: f64,
-    pub x_lim_time: f64,
-    pub y_lim_time: f64,
-    pub move_limit: f64,
-    pub hold_time: f64
+    pub x: i32,
+    pub y: i32,
+    pub or_x: i32,
+    pub or_y: i32,
+    pub x_lim_time: i32,
+    pub y_lim_time: i32,
+    pub move_limit: i32,
+    pub hold_time: i32
 }
 
 impl Copy for MouseArrow {}
@@ -66,101 +86,41 @@ impl MouseArrow {
     pub fn load_default() -> Self {
         let config = Config::load();
         Self {
-            or_x: 0.0,
-            or_y: 0.0,
-            x_lim_time: 0.0,
-            y_lim_time: 0.0,
+            x: 0,
+            y: 0,
+            or_x: 0,
+            or_y: 0,
+            x_lim_time: 0,
+            y_lim_time: 0,
             move_limit: config.move_limit,
             hold_time: config.hold_time
         }
     }
 
     pub fn set_default(&mut self) -> Self {
-        self.or_x = 0.0;
-        self.or_y = 0.0;
-        self.x_lim_time = 0.0;
-        self.y_lim_time = 0.0;
+        self.x = 0;
+        self.y = 0;
+        self.or_x = 0;
+        self.or_y = 0;
+        self.x_lim_time = 0;
+        self.y_lim_time = 0;
         return *self
     }
 }
 
 
-
-static QUIT_COMBO: AtomicI8 = AtomicI8::new(0);
-static PASSTHROUGH: AtomicBool = AtomicBool::new(false);
-static STOP_REP: AtomicBool = AtomicBool::new(false);
-
-
-static CONV_MOUSE_BUTTON: LazyLock<HashMap<Button, Key>> = LazyLock::new(|| HashMap::from([
-    (Button::Left, Key::Unknown(0x86)),      //F23
-    (Button::Right, Key::Unknown(0x85)),     //F22
-    (Button::Middle, Key::Unknown(0x84)),    //F21
-    (Button::Unknown(0x05), Key::Unknown(0x83)),        //F20 & button_extra -> might need to change these to "keys" as button may not be recognised
-    (Button::Unknown(0x06), Key::Unknown(0x82)),        //F19 & button side
-    ]));
-
-static CONV_KEY: LazyLock<HashMap<Key, Key>> = LazyLock::new(|| HashMap::from([
-    (Key::CapsLock, Key::Unknown(0x87)),     //F24
-    (Key::UpArrow, Key::Unknown(0x81)),       //F18
-    (Key::DownArrow, Key::Unknown(0x80)),     //F17
-    ]));
-
-
-static TRACKED_KEYS_STATE: LazyLock<Mutex<HashMap<Key, i8>>> = LazyLock::new(|| Mutex::new(HashMap::from([
-    (Key::CapsLock, 0),
-    (Key::F5, 0),
-    (Key::F7, 0),
-    (Key::F8, 0),
-    ])));
-
-static TRACKED_BUTTONS_STATE: LazyLock<Mutex<HashMap<Button, i8>>> = LazyLock::new(|| Mutex::new(HashMap::from([
-    (Button::Left, 0),
-    (Button::Right, 0),
-    (Button::Middle, 0),
-    (Button::Unknown(0x05), 0),        //button_extra & side -> might need to change these to "keys" as button may not be recognised
-    (Button::Unknown(0x06), 0),
-    ])));
-
-static MOUSEARROW: LazyLock<Mutex<MouseArrow>> = LazyLock::new(|| Mutex::new(MouseArrow::load_default()));
-
-static KANATA: LazyLock<Mutex<Vec<Child>>> = LazyLock::new(|| Mutex::new(vec![]));
-
-
 fn main() {
-
-
-    // initialize logger
-    Builder::new()
-        .filter_level(LevelFilter::Trace)  // This shows everything
-        .init();
-
-
-    // load config to mousearrow struct
-    MouseArrow::load_default();
-
-
-    // \n not needed for some reason, the visual formatting is enough.
-    println!("
-        **IMPORTANT:
-        Force quit keybind: F5+F7+F8
-        Mouse passthrough: Hold Caps Lock
-        
-        WARNING: This program redirects all of the inputs from the devices you select to its 'mousekey' uinput device.
-        Please be prepared to force quit the terminal and possibly power down your device before proceeding.
-    ");
-    
-    thread::sleep(time::Duration::from_millis(1000)); // creates a gap between warning message and program begin
 
     // start kanata
     println!("\nStarting Kanata:\n");
 
     // look into wintercept driver version
 
-    KANATA.lock().unwrap().push(Command::new("./kanata_windows_tty_winIOv2_x64.exe")
+    let mut kanata = Command::new("./kanata_windows_tty_winIOv2_x64.exe")
         .arg("--cfg")
         .arg("mousekey.kbd")
         .spawn()
-        .unwrap());
+        .unwrap();
     
 
     thread::sleep(time::Duration::from_millis(3000)); // creates a gap between warning message and program begin
@@ -168,174 +128,120 @@ fn main() {
     println!("\nKanata started. Continuing...\n");
 
 
-    //let (cltx, clrx) = mpsc::channel();
-
-    // capslock/mouse passthrough thread
-    /* thread::spawn(move || {
-        loop {
-            let val = clrx.recv().unwrap();
-            if val == 2 {mouse_passthrough_tx.store(true, Ordering::Relaxed);}
-            else if mouse_passthrough_tx.load(Ordering::Relaxed) == true {
-                mouse_passthrough_tx.store(false, Ordering::Relaxed);
-            }
-        }
-    }); */
-    
-    
-    thread::spawn(move || { 
-        loop {
-            let _ = listen(listen_callback);
-        }
-    });
-
-
-
-    // main loop
+    let mut quit_combo: [bool; 3] = [false; 3];
+    let mut mousearrow = MouseArrow::load_default();
+    let mut previous_pos  = POINT {x:0, y:0};
 
     loop {
-        let _ = grab(grab_callback);
-
-         }
-    }
-
-fn listen_callback(ev: Event){
-    match ev.event_type {
-        EventType::KeyPress(k) => {if !(TRACKED_KEYS_STATE.lock().unwrap().contains_key(&k)) {};  process_keyboard(k, true);},
-        EventType::KeyRelease(k) => {if !(TRACKED_KEYS_STATE.lock().unwrap().contains_key(&k)) {};  process_keyboard(k, false);},
-        _ => {}
-    }
-}
-
-
-
-fn grab_callback(ev: Event) -> Option<Event> {
-    match check_mouse_passthrough() {false => {}, true => {return Some(ev)}};
-    match ev.event_type {
-        EventType::ButtonPress(b) => {if !(TRACKED_BUTTONS_STATE.lock().unwrap().contains_key(&b)) {return Some(ev)};  process_mouse_b(b, true); return v1::None},
-        EventType::ButtonRelease(b) => {if !(TRACKED_BUTTONS_STATE.lock().unwrap().contains_key(&b)) {return Some(ev)};  process_mouse_b(b, false); return v1::None},
-        EventType::Wheel { delta_x: _, delta_y } => {process_mouse_w(delta_y); return v1::None}
-        EventType::MouseMove { x, y } => {process_mouse_m(x, y); return v1::None}
-        _ => {return Some(ev)}
-    }
-}
-
-fn process_keyboard(key: Key, down: bool) {
-    let mut tracked_val = match TRACKED_KEYS_STATE.lock().unwrap().get(&key) {Some(k) => {*k}, v1::None => {return}};
-
-    match down {
-        true => {if tracked_val == 2 {} else if tracked_val == 1 {tracked_val = 2} else {tracked_val = 1}}
-        false => {tracked_val = 0}
-    }
-    let _ = TRACKED_KEYS_STATE.lock().unwrap().entry(key).and_modify(|val| *val = tracked_val);
-    
-
-    if key == Key::F5 || key ==  Key::F7 || key ==  Key::F8 {
-        let mut qc = QUIT_COMBO.load(Ordering::Relaxed);
-        qc += match tracked_val {0 => {-1}, 1 => {1}, _ => {0; return}};
-        if qc < 0 {qc = 0}
-        if qc == 3 {
-            KANATA.lock().unwrap()[0].kill().expect("WARNING!! Kanata could not be killed!!!");
+        quit_combo = check_force_quit(quit_combo);
+        if quit_combo == [true; 3] {
+            kanata.kill().expect("WARNING!! Kanata could not be killed!!!");
             panic!("__ ___ FORCE QUIT ___ __");
         }
-        QUIT_COMBO.store(qc, Ordering::Relaxed);
-        return
+
+        if check_mouse_passthrough() == true {
+            if STOP_REP.load(Ordering::Relaxed) == false {STOP_REP.store(true, Ordering::Relaxed);}
+            mousearrow = MouseArrow::set_default(&mut mousearrow);
+            thread::sleep(time::Duration::from_millis(10));
+            continue
+        }
+
+        let mut position = POINT {x:0, y:0};
+        match get_mouse_position() {//          compiler thinks position is unused if just a continue
+            Ok(pos) => {position = pos}, Err(_) => {let _ = position; continue}
+        };
+
+        if position == previous_pos {continue};
+
+        previous_pos = position;
+
+        mousearrow = process_mouse_m(position.x, position.y, mousearrow);
+
+        thread::sleep(time::Duration::from_millis(10));
+
     }
+}
+
+// shameless copy of https://docs.rs/mouse_position/latest/src/mouse_position/impl_windows.rs.html#2-19
+fn get_mouse_position() -> Result<POINT, MouseKeyError> {
+    let mut position = POINT {x:0, y:0};
+    match unsafe {GetCursorPos(&mut position)} {
+        Ok(_) => {return Ok(position)}, Err(_) => {return Err(MouseKeyError::FailedGetMousePosition)}
+    };
+} 
+
+fn check_mouse_passthrough() -> bool {
+    let mut passthrough_key_state = vec![];
+    unsafe {passthrough_key_state.push(GetAsyncKeyState(KeyboardAndMouse::VK_F13.0 as i32))};
+
+    match passthrough_key_state[0] {KEY_PRESS_VAL_BIG => {return true}, KEY_PRESS_VAL_SMALL => {return true}, _ => {return false}};
+}
+
+fn check_force_quit(mut quit_combo: [bool; 3]) -> [bool; 3] {
+    let mut force_quit_key_state = vec![];
+    for k in QUIT_KEYS {
+        unsafe {force_quit_key_state.push(GetAsyncKeyState(k.0 as i32))};
+    };
+
+    let mut idx: usize = 0;
+    for k in &force_quit_key_state {
+        quit_combo[idx] = match *k {KEY_PRESS_VAL_BIG => {true}, KEY_PRESS_VAL_SMALL => {true}, _ => {false}};
+        idx += 1;
+    }
+
+    return quit_combo
+}
+
+fn process_mouse_m(x: i32, y: i32, mut mousearrow: MouseArrow) -> MouseArrow {
     
-    //let passthrough: Key = *CONV_KEY.get(&Key::CapsLock).unwrap();
-    let passthrough: Key = Key::CapsLock;
-    if key == passthrough {//let _ = cltx.send(tracked_val);
-        if tracked_val == 2 {PASSTHROUGH.store(true, Ordering::Relaxed);}
-        else if PASSTHROUGH.load(Ordering::Relaxed) == true {
-            PASSTHROUGH.store(false, Ordering::Relaxed);
-    }
-}
-
-}
-
-fn process_mouse_b(button: Button, down: bool) {
-    /* let mut tracked_val = match TRACKED_BUTTONS_STATE.lock().unwrap().get_mut(&button) {Some(b) => {*b}, v1::None => {return}};
-
-    match down {
-        true => {if tracked_val == 2 {} else if tracked_val == 1 {tracked_val = 2} else {tracked_val = 1}}
-        false => {tracked_val = 0}
-    } */
-    *MOUSEARROW.lock().unwrap() = MouseArrow::set_default(&mut MOUSEARROW.lock().unwrap());
-    STOP_REP.store(true, Ordering::Relaxed);
-
-    let conv_button = *CONV_MOUSE_BUTTON.get(&button).unwrap();
-
-    match down {
-        true => {let _ = simulate(&EventType::KeyPress(conv_button));}
-        false => {let _ = simulate(&EventType::KeyRelease(conv_button));}
-    }
-    return
-
-}
-
-fn process_mouse_w(value: i64) {
-    if value == 0 {return}
-
-    let mut dir_code = Key::Return;
-
-    if value > 0 {
-        dir_code = Key::UpArrow;
-    }
-    else if value < 0 {
-        dir_code = Key::DownArrow;
-    }
-    if dir_code != Key::Return {
-        let conv_code = match CONV_KEY.get(&dir_code) {Some(code) => {*code}, v1::None => {return}};
-        let _ = simulate(&EventType::KeyPress(conv_code));
-        let _ = simulate(&EventType::KeyRelease(conv_code));
-    }
-
-}
-
-fn process_mouse_m(x: f64, y: f64) {
-    let mut mousearrow = MOUSEARROW.lock().unwrap().clone();
-    
-    if mousearrow.or_x == 0.0 && mousearrow.or_y == 0.0 {
+    if mousearrow.or_x == 0 && mousearrow.or_y == 0 {
         mousearrow.or_x = x;
         mousearrow.or_y = y;
-        *MOUSEARROW.lock().unwrap() = mousearrow;
-        return
+        return mousearrow;
     }
-    let mut rel_x = x- mousearrow.or_x;
-    let mut rel_y = mousearrow.or_y - y;
+    mousearrow.x += x- mousearrow.or_x;
+    mousearrow.y += mousearrow.or_y - y;
 
     // "normalise" -> we only want one axis at a time to be near move_limit
 
-    if rel_x.abs() > (mousearrow.move_limit* 0.75) {rel_y = 0.0};
-    if rel_y.abs() > (mousearrow.move_limit* 0.75) {rel_x = 0.0};
+    if mousearrow.x.abs() > ((mousearrow.move_limit as f32 * 0.75) as i32) {mousearrow.y = 0};
+    if mousearrow.y.abs() > ((mousearrow.move_limit as f32 * 0.75) as i32) {mousearrow.x = 0};
 
-    if rel_x.abs() >= mousearrow.move_limit {
-        /* let mut dir = 1; // only if we need to store current pos
-        if rel_x < 0.0 {dir = -1}; */
+    if mousearrow.x.abs() >= mousearrow.move_limit {
+        let mut capped_x = -mousearrow.move_limit;
+
         let mut key = Key::LeftArrow;
-        if rel_x > 0.0 {key = Key::RightArrow};
+        if mousearrow.x > 0 {key = Key::RightArrow; capped_x = mousearrow.move_limit};
 
-        mousearrow.x_lim_time = mouse_arrows(key,mousearrow.x_lim_time);
+        mousearrow.x = capped_x;
+
+
+        mousearrow.x_lim_time = mouse_arrows(key,mousearrow.x_lim_time, mousearrow.hold_time);
         
     }
 
-    else if rel_y.abs() >= mousearrow.move_limit {
-        /* let mut dir = 1; // only if we need to store current pos
-        if rel_y < 0.0 {dir = -1}; */
-        let mut key = Key::DownArrow;
-        if rel_y > 0.0 {key = Key::UpArrow};
+    else if mousearrow.y.abs() >= mousearrow.move_limit {
+        let mut capped_y = -mousearrow.move_limit;
 
-        mousearrow.y_lim_time = mouse_arrows(key,mousearrow.y_lim_time);
+        let mut key = Key::DownArrow;
+        if mousearrow.y > 0 {key = Key::UpArrow; capped_y = mousearrow.move_limit};
+
+        mousearrow.y = capped_y;
+
+        mousearrow.y_lim_time = mouse_arrows(key,mousearrow.y_lim_time, mousearrow.hold_time);
         
     }
     else {
-        STOP_REP.store(true, Ordering::Relaxed);
-        mousearrow.x_lim_time = 0.0;
-        mousearrow.y_lim_time = 0.0;
-    } // stop repeating
+        if STOP_REP.load(Ordering::Relaxed) == false {STOP_REP.store(true, Ordering::Relaxed);}
+        mousearrow.x_lim_time = 0;
+        mousearrow.y_lim_time = 0;
+    }
 
+    //println!("{:?}", mousearrow);
 
+    let _ = ENIGO.lock().unwrap().move_mouse(mousearrow.or_x, mousearrow.or_y, Coordinate::Abs);
 
-    *MOUSEARROW.lock().unwrap() = mousearrow;
+    return mousearrow
 
 }
 
@@ -343,27 +249,24 @@ fn process_mouse_m(x: f64, y: f64) {
 
 
 
-fn mouse_arrows(key: Key, mut axis_lim_time: f64) -> f64 {
-    let hold_time = MOUSEARROW.lock().unwrap().hold_time;
+fn mouse_arrows(key: Key, mut axis_lim_time: i32, hold_time: i32) -> i32 {
 
-
-
-    if axis_lim_time == 0.0 {
-        let _ = simulate(&EventType::KeyPress(key));
-        let _ = simulate(&EventType::KeyRelease(key));
+    if axis_lim_time == 0 {
+        let _ = ENIGO.lock().unwrap().key(key, Press);
+        let _ = ENIGO.lock().unwrap().key(key, Release);
+        //println!("{:?}", key);
     }
 
     if axis_lim_time > hold_time {
-        if axis_lim_time < 1000.0 {
-            axis_lim_time = 1000.0;
-            STOP_REP.store(true, Ordering::Relaxed);
-            thread::sleep(time::Duration::from_millis(51));
+        if axis_lim_time < 1000 {
+            axis_lim_time = 1000;
             STOP_REP.store(false, Ordering::Relaxed);
             create_m_ar_thread(key);
+            //println!("REPEATING {:?}", key);
         }
     }
 
-    axis_lim_time += 1.0;
+    axis_lim_time += 1;
     return axis_lim_time
 
 }
@@ -372,24 +275,12 @@ fn create_m_ar_thread(rep_key: Key) {
     thread::spawn(move || { 
         while STOP_REP.load(Ordering::Relaxed) == false {
 
+            if STOP_REP.load(Ordering::Relaxed) == true || PASSTHROUGH.load(Ordering::Relaxed) == true {break}
+
+            let _ = ENIGO.lock().unwrap().key(rep_key, Press);
+            let _ = ENIGO.lock().unwrap().key(rep_key, Release);
+
             thread::sleep(time::Duration::from_millis(50));
-
-            if STOP_REP.load(Ordering::Relaxed) == true || PASSTHROUGH.load(Ordering::Relaxed) == true {STOP_REP.store(false, Ordering::Relaxed); break}
-
-            let _ = simulate(&EventType::KeyPress(rep_key));
-            let _ = simulate(&EventType::KeyRelease(rep_key));
         }
     });
 }
-
-fn check_mouse_passthrough() -> bool {
-    if PASSTHROUGH.load(Ordering::Relaxed) == true {
-        *MOUSEARROW.lock().unwrap() = MouseArrow::set_default(&mut *MOUSEARROW.lock().unwrap());
-        STOP_REP.store(true, Ordering::Relaxed);
-        return true
-    }
-
-    return false
-}
-
-
