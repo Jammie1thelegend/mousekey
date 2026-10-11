@@ -1,22 +1,84 @@
+
+;; layout is modified enthium, slightly rearranged to account for fewer keys on mouse. the keyboard is big because I have long fingers and can comfortably 
+;; reach most of these keys, the uncomfortable ones being seldom used and thus it does not matter. 
+;; Mileage may vary, feel free to add or remove keys as you see fit.
+
 (defcfg
-    input (device-file "/dev/input/by-id/usb-0c45_USB_Keyboard-event-kbd")
-    output (uinput-sink "mousekey")
+  log-layer-changes yes
 )
 
-(defsrc
-  esc  f1   f2   f3   f4   f5   f6   f7   f8   f9   f10  f11  f12        ssrq slck pause
-  grv  1    2    3    4    5    6    7    8    9    0    -    =    bspc  ins  home pgup  nlck kp/  kp*  kp-
-  tab  q    w    e    r    t    y    u    i    o    p    [    ]    \     del  end  pgdn  kp7  kp8  kp9  kp+
-  caps a    s    d    f    g    h    j    k    l    ;    '    ret                        kp4  kp5  kp6
-  lsft z    x    c    v    b    n    m    ,    .    /    rsft                 up         kp1  kp2  kp3  kprt
-  lctl lmet lalt           spc            ralt rmet cmp  rctl            left down rght  kp0  kp.
+
+(defsrc ;;   keyboard                       mouse             live reload for main program (do not remove!)
+  esc  f1   f2   f3   f4    f5                up                 f14
+       1    2    3    4    5         mlft     mwu    mrgt
+  tab  q    w    e    r    t         left     mmid   right
+  caps a    s    d    f    g         mfwd     mwd
+  lsft z    x    c    v    b         mbck     down
+  lctl lmet lalt      spc       
 )
 
-(deflayer name
-  esc  f1   f2   f3   f4   f5   f6   f7   f8   f9   f10  f11  f12        ssrq slck pause
-  grv  1    2    3    4    5    6    7    8    9    0    -    =    bspc  ins  home pgup  nlck kp/  kp*  kp-
-  tab  q    w    e    r    t    y    u    i    o    p    [    ]    \     del  end  pgdn  kp7  kp8  kp9  kp+
-  caps a    s    d    f    g    h    j    k    l    ;    '    ret                        kp4  kp5  kp6
-  lsft z    x    c    v    b    n    m    ,    .    /    rsft                 up         kp1  kp2  kp3  kprt
-  lctl lmet lalt           spc            ralt rmet cmp  rctl            left down rght  kp0  kp.
+(deflayer enthium_base
+  esc  f1   f2   f3   f4    f5                up                 lrld
+       1    2    3    4    /         @ne2     h      @se3
+  tab  q    y    o    u    =         left     r      right
+  @bm  @fc  i    a    e    -         @de1     t
+  @t_s '    @f,  @f.  @f;  [         l        down
+  @t_c lmet lalt      spc
+)
+
+
+(deflayer enthium_1 ;; _ = passthrough, XX = no output
+  XX   f11  f12  XX   XX   f5                 XX                 lrld
+       f6   f7   f8   f9   f10       @spe2    m      @0e3
+  XX   5    6    7    8    9         home     XX     end
+  @xm  v    k    p    f    w         XX       g 
+  _    z    j    XX   XX   del       @t_c     XX
+  _    _    _        spc
+)
+
+(deflayer enthium_2 ;; _ = passthrough, XX = no output
+  XX   XX   XX   XX   XX   f5                 XX                 lrld
+       XX   XX   XX   XX   \         XX       ent  XX
+  XX   XX   XX   XX   XX   XX        XX       lrld XX
+  XX   XX   XX   XX   XX   XX        XX       bspc
+  _    XX   XX   XX   XX   ]         XX       XX
+  _    _    _        XX
+)
+
+(deflayer enthium_3 ;; _ = passthrough, XX = no output
+  XX   XX   XX   XX   XX   f5                 XX                 lrld
+       XX   XX   XX   XX   XX        XX       XX   XX
+  XX   XX   XX   XX   XX   XX        XX       XX   XX
+  XX   XX   XX   XX   XX   XX        XX       rpt
+  XX   XX   XX   XX   XX   XX        XX       XX
+  XX   XX   XX       XX
+)
+(deflayer mouse_passthrough ;; _ = passthrough, XX = no output
+  _    _    _    _    _    _                  up                 lrld
+       _    _    _    _    _         mlft     mwu    mrgt
+  _    _    _    _    _    _         left     mmid   right
+  _    _    _    _    _    _         mfwd     mwd
+  _    _    _    _    _    _         mbck     down 
+  _    _    _        _ 
+)
+
+
+
+
+
+
+(defalias
+  bm (tap-hold-press 200 200 b (multi f13 (layer-while-held mouse_passthrough))) ;; tap for b, hold for mouse passthrough
+  xm (tap-hold-press 200 200 x (multi f13 (layer-while-held mouse_passthrough))) ;; tap for x, hold for mouse passthrough
+  t_s (tap-hold-press 200 200 (one-shot-release 1000 lsft) lsft) ;; tap for shift+ press key, hold for normal shift
+  t_c (tap-hold-press 200 200 (one-shot-release 1000 lctl) lctl) ;; tap for ctl+ press key, hold for normal ctl
+  fc (fork c (fork a a (lsft)) (lctl))
+  f, (fork , (fork x x (lsft)) (lctl))
+  f. (fork . (fork c c (lsft)) (lctl))
+  f; (fork ; (fork v v (lsft)) (lctl))
+  de1 (tap-hold-press 200 200 d (layer-while-held enthium_1))
+  ne2 (tap-hold-press 200 200 n (layer-while-held enthium_2))
+  spe2 (tap-hold-press 200 200 spc (layer-while-held enthium_2))
+  se3 (tap-hold-press 200 200 s (layer-while-held enthium_3))
+  0e3 (tap-hold-press 200 200 0 (layer-while-held enthium_3))
 )
