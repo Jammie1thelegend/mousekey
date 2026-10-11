@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::config::Config;
+use crate::{config::Config};
 
 
 #[derive(Error, Debug)]
@@ -16,58 +16,6 @@ pub enum Dir {
     Down,
     Left,
     Right
-}
-
-
-#[derive(Debug)]
-pub enum MouseKeyEventType {
-    KeyEvent(KeyEvent),
-    RelativeAxisEvent(RelativeAxisEvent),
-}
-
-#[derive(Copy, Clone)]
-#[derive(Debug)]
-#[derive(PartialEq)]
-pub enum KeyEvent {
-    None,
-    Left,
-    Right,
-    Up,
-    Down,
-    CapsLock,
-    F5,
-    F6,
-    F7,
-    F8,
-    F13,
-    F14,
-    MouseLeft,
-
-}
-
-#[derive(Copy, Clone)]
-#[derive(Debug)]
-#[derive(PartialEq)]
-pub enum RelativeAxisEvent {
-    None,
-    XAxis,
-    YAxis,
-}
-
-#[derive(Debug)]
-pub struct MouseKeyEvent {
-    pub event: MouseKeyEventType,
-    pub value: i32,
-}
-
-impl MouseKeyEvent {
-    pub fn new(event_type: MouseKeyEventType, event_value: i32) -> MouseKeyEvent {
-        let new = MouseKeyEvent {
-            event: event_type,
-            value: event_value,
-        };
-        return new
-    }
 }
 
 #[derive(Copy, Clone)]
@@ -94,6 +42,22 @@ pub enum AxisOutput {
     NoOutput,
     SingleSend,
     Repeat,
+}
+
+#[derive(Copy, Clone)]
+#[derive(PartialEq)]
+#[derive(Debug)]
+pub enum HandleKeyboardResult {
+    NoOutput,
+    ForceQuit,
+    StartPassthrough,
+    StopPassthrough,
+}
+
+#[derive(Debug)]
+pub struct PlaceHolderName {
+    pub major: MouseKeyAxisInfo,
+    pub minor: MouseKeyAxisInfo
 }
 
 #[derive(Copy, Clone)]
@@ -132,6 +96,11 @@ impl MouseKeyAxisInfo {
 
     return clamped_val
     }
+
+    pub fn choose_major_axis(mut axes: PlaceHolderName) -> Self {
+        if axes.major.val.abs() > ((axes.major.limit as f32 * 0.75) as i32) {axes.minor.val = 0};
+        return axes.minor
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -154,4 +123,66 @@ impl MouseArrow {
         self.y_axis = MouseKeyAxisInfo::vals_to_zero(self.y_axis);
         return self
     }
+}
+
+pub mod event_types {
+    #[derive(Copy, Clone)]
+    #[derive(Debug)]
+    #[derive(PartialEq)]
+    pub enum KeyEventCode {
+        None,
+        Left,
+        Right,
+        Up,
+        Down,
+        CapsLock,
+        F5,
+        F6,
+        F7,
+        F8,
+        F13,
+        F14,
+        MouseLeft,
+
+    }
+
+    #[derive(Copy, Clone)]
+    #[derive(Debug)]
+    #[derive(PartialEq)]
+    pub enum RelativeAxisEventCode {
+        None,
+        XAxis,
+        YAxis,
+    }
+
+    pub struct KeyEvent {
+        pub code: KeyEventCode, 
+        pub val: i32
+    }
+
+    impl KeyEvent {
+        pub fn new(code: KeyEventCode, val: i32) -> Self {
+            let new = KeyEvent {
+                code: code,
+                val: val
+            };
+            return new
+        }
+    }
+
+    pub struct RelativeAxisEvent {
+        pub code: RelativeAxisEventCode, 
+        pub val: i32
+    }
+
+    impl RelativeAxisEvent {
+        pub fn new(code: RelativeAxisEventCode, val: i32) -> Self {
+            let new = RelativeAxisEvent {
+                code: code,
+                val: val
+            };
+            return new
+        }
+    }
+
 }

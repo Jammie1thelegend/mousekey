@@ -3,6 +3,7 @@ use std::fs;
 use serde::Deserialize;
 
 
+#[derive(Copy, Clone)]
 #[derive(Deserialize)]
 #[derive(Debug)]
 pub struct Config {
