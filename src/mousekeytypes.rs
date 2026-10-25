@@ -1,12 +1,27 @@
 use thiserror::Error;
 
-use crate::{config::Config};
+use crate::{config::Config, mousekeytypes::event_types::KeyEventCode};
+
+
+pub const QUIT_KEYS: [KeyEventCode; 3] = [KeyEventCode::F5, KeyEventCode::F7, KeyEventCode::F8];
+pub const PASSTHROUGH_KEY: KeyEventCode = KeyEventCode::F13;
+pub const EMITTER_KEYS: [KeyEventCode; 4] = [KeyEventCode::Up, KeyEventCode::Down, KeyEventCode::Left, KeyEventCode::Right];
+pub const PRIVATE_KANATA_LRLD: KeyEventCode = KeyEventCode::F14;
+pub const CFG_PATH: &str = "config.toml";
+pub const CFG_DEFAULT: &str = "move_limit = 40\nhold_time = 45\nshow_layer = true";
+pub const KANATA_CFG_PATH: &str = "mousekey.kbd";
+
+#[cfg(target_os = "linux")]
+pub const KANATA_APPLICATION_PATH: &str = "./kanata_linux_x64";
+#[cfg(target_os = "windows")]
+pub const KANATA_APPLICATION_PATH: &str = "./kanata_windows_tty_winIOv2_x64.exe";
+
 
 
 #[derive(Error, Debug)]
 pub enum MouseKeyError {
     #[error("Failed to find a compatible input device. Make sure you are running the application with root priviledges.")]
-    NoDeviceError
+    NoDeviceError,
 }
 
 #[derive(Debug)]

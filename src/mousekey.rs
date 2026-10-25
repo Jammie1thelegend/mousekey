@@ -1,7 +1,14 @@
 
 use std::process::{Child};
+use std::fs;
 use std::{thread, time};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::io;
+use std::io::Read;
+
+use log::{LevelFilter};
+use env_logger::Builder;
+
 
 use crate::config::Config;
 use crate::os_specific;
@@ -10,52 +17,114 @@ use crate::os_specific;
 
 use crate::mousekeytypes::{AxisOutput, HandleKeyboardResult, MouseArrow, MouseKeyAxisInfo, MouseKeyError, PlaceHolderName, RelativeCoord};
 use crate::mousekeytypes::event_types::{KeyEvent, RelativeAxisEvent, KeyEventCode, RelativeAxisEventCode};
-
-const QUIT_KEYS: [KeyEventCode; 3] = [KeyEventCode::F5, KeyEventCode::F7, KeyEventCode::F8];
-const PASSTHROUGH_KEY: KeyEventCode = KeyEventCode::F13;
-const EMITTER_KEYS: [KeyEventCode; 4] = [KeyEventCode::Up, KeyEventCode::Down, KeyEventCode::Left, KeyEventCode::Right];
-const PRIVATE_KANATA_LRLD: KeyEventCode = KeyEventCode::F14;
+use crate::mousekeytypes::{QUIT_KEYS, PASSTHROUGH_KEY};
 
 
 static PASSTHROUGH: AtomicBool = AtomicBool::new(false);
 static STOP_REP: AtomicBool = AtomicBool::new(false);
 
 
+pub fn setup(kanata_cfg_path: &str, config: Config) -> Child {
 
-fn main() {
-    // add error handling (return result not just requested thing)
-    let config: Config = Config::load();
+    Builder::new()
+    .filter_level(LevelFilter::Trace)
+    .init();
 
-    let kanata: Child = os_specific::setup_kanata(vec![PRIVATE_KANATA_LRLD], &config);
+    handle_show_layers(kanata_cfg_path, config);
 
-    os_specific::get_input_devices();
+    // \n not needed for some reason, the visual formatting is enough.
+    println!("
+        **IMPORTANT:
+        Force quit keybind: F5+F7+F8
+        Mouse passthrough: Hold Caps Lock
+        
+        WARNING: This program redirects all of the inputs from the devices you select to its 'mousekey' uinput device.
+        Please be prepared to force quit the terminal and possibly power down your device before proceeding.
+    ");
+    
+    thread::sleep(time::Duration::from_millis(1000)); // creates a gap between warning message and program begin
 
-    //keyboard thread
-    let mut keyboard_thr_kanata = kanata;
-    thread::spawn(move || {
-        let mut quit_combo: i8 = 0;
-        let mut result: HandleKeyboardResult;
+    // start kanata
+    println!("\nStarting Kanata:\n");
 
-        loop {
-            (quit_combo, result) = handle_keyboard(quit_combo);
-            handle_keyboard_result(result, &mut keyboard_thr_kanata);
-            
+
+
+    let kanata: Child = os_specific::start_kanata(kanata_cfg_path);
+    
+    let stdin = io::stdin();
+
+    let mut line = String::new();
+
+    while line.find("") == None {
+        let mut stdin = stdin.lock(); // locking is optional
+
+        // Could also `match` on the `Result` if you wanted to handle `Err` 
+        while let Ok(n_bytes) = stdin.read_to_string(&mut line) {
+            if n_bytes == 0 {break;}
+            println!("READ: {}", line);
+            line.clear();
         }
-    });
+    }
+
+    //logic to match on line to know when kanata has finished starting
+    
 
 
-    //mouse thread
-    let mouse_thr_config = config.clone();
-    thread::spawn(move || {
-        let mut mousearrow: MouseArrow = MouseArrow::load_default(mouse_thr_config);
+    thread::sleep(time::Duration::from_millis(3000)); // creates a gap between warning message and program begin
 
-        loop {
-            mousearrow = handle_mouse(mousearrow);
-        }
-    });
+    println!("\nKanata started. Continuing...\n");
+
+    return kanata
+
+        
 }
 
-fn handle_keyboard(mut quit_combo: i8) -> (i8, HandleKeyboardResult) {
+
+fn handle_show_layers(kanata_cfg_path: &str, config: Config) {
+    match fs::File::open(kanata_cfg_path) {
+        Ok(file) => {file}, 
+        Err(_) => {panic!("could not find/ open {}!", kanata_cfg_path)}
+    };
+
+    let mut kanata_cfg_str = match fs::read_to_string(kanata_cfg_path) {
+            Ok(raw) => {raw}, Err(_) => {panic!("could not read {}!", kanata_cfg_path)}
+        };
+
+    match kanata_cfg_path.find("defcfg") {
+        Some(_) => {match kanata_cfg_str.find("log-layer-changes") {
+            Some(_) => {},
+            None => {kanata_cfg_str = kanata_cfg_str.replace("defcfg\n", "defcfg\nlog-layer-changes no\n");}
+        };},
+        None => {kanata_cfg_str = "(defcfg\nlog-layer-changes no\n)".to_owned() + &kanata_cfg_str}
+    }
+    
+
+    let mut kanata_cfg_str_replaced: String = "".to_string();
+    
+    match config.show_layer {
+        false => {
+            if kanata_cfg_str.find("log-layer-changes no") == None {
+                kanata_cfg_str_replaced = kanata_cfg_str.replace("log-layer-changes yes", "log-layer-changes no");
+            }
+        },
+        true => {
+            if kanata_cfg_str.find("log-layer-changes yes") == None  {
+                kanata_cfg_str_replaced = kanata_cfg_str.replace("log-layer-changes no", "log-layer-changes yes");
+            }
+        }
+    }
+
+    if kanata_cfg_str_replaced != "".to_string() {
+        match fs::write(kanata_cfg_path, kanata_cfg_str_replaced) {
+            Ok(_) => {}, Err(_) => {panic!("could not write to {}!", kanata_cfg_path);}
+        };
+    }
+
+    println!("\nShow layers set to: {}\n", config.show_layer);
+
+}
+
+pub fn handle_keyboard(mut quit_combo: i8) -> (i8, HandleKeyboardResult) {
     for event in os_specific::fetch_keyboard_events() {
         if QUIT_KEYS.contains(&event.code) {
             quit_combo += match event.val {0 => {-1}, 1 => {1}, _ => {0}};
@@ -78,7 +147,7 @@ fn handle_keyboard(mut quit_combo: i8) -> (i8, HandleKeyboardResult) {
     return (quit_combo, HandleKeyboardResult::NoOutput)
 }
 
-fn handle_keyboard_result(code: HandleKeyboardResult, kanata: &mut Child) {
+pub fn handle_keyboard_result(code: HandleKeyboardResult, kanata: &mut Child) {
     match code {
         HandleKeyboardResult::NoOutput => {return},
 
@@ -99,7 +168,7 @@ fn handle_keyboard_result(code: HandleKeyboardResult, kanata: &mut Child) {
 }
 
 
-fn handle_mouse(mut mousearrow: MouseArrow) -> MouseArrow {
+pub fn handle_mouse(mut mousearrow: MouseArrow) -> MouseArrow {
 
     if PASSTHROUGH.load(Ordering::Relaxed) == true {
         STOP_REP.store(true, Ordering::Relaxed);
